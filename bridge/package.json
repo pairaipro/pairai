@@ -4,12 +4,6 @@
   "description": "PairAI OpenRouter Bridge — headless AI agent daemon",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://pairai.pro",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/pairaipro/pairai",
-    "directory": "bridge"
-  },
   "bin": {
     "pairai-bridge": "bin.js"
   },
