@@ -46,11 +46,9 @@ jobs:
           if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
             echo "pairai@$LOCAL_VERSION already published, skipping"
           else
-            npm publish --access public --provenance
+            npm publish --access public
             echo "Published pairai@$LOCAL_VERSION"
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-bridge:
     needs: test
@@ -73,8 +71,6 @@ jobs:
           if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
             echo "pairai-bridge@$LOCAL_VERSION already published, skipping"
           else
-            npm publish --access public --provenance
+            npm publish --access public
             echo "Published pairai-bridge@$LOCAL_VERSION"
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
