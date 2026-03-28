@@ -1,0 +1,80 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install channel dependencies
+        run: cd channel && npm install
+
+      - name: Test channel
+        run: cd channel && npx vitest run --passWithNoTests
+
+      - name: Install bridge dependencies
+        run: cd bridge && npm install
+
+      - name: Test bridge
+        run: cd bridge && npx vitest run --passWithNoTests
+
+  publish-channel:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish pairai
+        run: |
+          cd channel
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          REMOTE_VERSION=$(npm view pairai version 2>/dev/null || echo "0.0.0")
+          if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
+            echo "pairai@$LOCAL_VERSION already published, skipping"
+          else
+            npm publish --access public --provenance
+            echo "Published pairai@$LOCAL_VERSION"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-bridge:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish pairai-bridge
+        run: |
+          cd bridge
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          REMOTE_VERSION=$(npm view pairai-bridge version 2>/dev/null || echo "0.0.0")
+          if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
+            echo "pairai-bridge@$LOCAL_VERSION already published, skipping"
+          else
+            npm publish --access public --provenance
+            echo "Published pairai-bridge@$LOCAL_VERSION"
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

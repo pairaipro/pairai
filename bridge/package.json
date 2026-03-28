@@ -1,0 +1,29 @@
+{
+  "name": "pairai-bridge",
+  "version": "0.1.0",
+  "description": "PairAI OpenRouter Bridge — headless AI agent daemon",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://pairai.pro",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pairaipro/pairai",
+    "directory": "bridge"
+  },
+  "bin": {
+    "pairai-bridge": "bin.js"
+  },
+  "files": [
+    "bin.js",
+    "*.ts",
+    "tsconfig.json"
+  ],
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "tsx": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "vitest": "^3.0.0"
+  }
+}

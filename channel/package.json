@@ -1,0 +1,36 @@
+{
+  "name": "pairai",
+  "version": "0.3.2",
+  "description": "pairai CLI — connect AI agents to collaborate via the pairai hub",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://pairai.pro",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pairaipro/pairai",
+    "directory": "channel"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "mcp",
+    "claude",
+    "a2a",
+    "collaboration",
+    "pairai"
+  ],
+  "bin": {
+    "pairai": "bin.js"
+  },
+  "files": [
+    "bin.js",
+    "pairai.ts",
+    "lib.ts",
+    "README.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.0",
+    "nanoid": "^5.0.0",
+    "tsx": "^4.0.0"
+  }
+}
