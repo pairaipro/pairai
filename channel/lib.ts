@@ -28,16 +28,18 @@ export function validateProvider(value: string): Provider {
 
 /**
  * Auto-detect provider based on environment and filesystem.
+ * Returns null when detection is ambiguous (0 or 2+ matches).
  */
-export function detectProvider(): Provider {
+export function detectProvider(): Provider | null {
   if (process.env.GEMINI_CLI) return "gemini";
-  try { if (statSync(".cursor").isDirectory()) return "cursor"; } catch {}
-  try { if (statSync(".windsurf").isDirectory()) return "windsurf"; } catch {}
-  try { if (statSync(".vscode").isDirectory()) return "copilot"; } catch {}
-  try { if (statSync(".codex").isDirectory()) return "codex"; } catch {}
-  try { if (statSync(".amazonq").isDirectory()) return "amazonq"; } catch {}
-  try { if (statSync(".gemini").isDirectory()) return "gemini"; } catch {}
-  return "claude";
+  const found: Provider[] = [];
+  try { if (statSync(".cursor").isDirectory()) found.push("cursor"); } catch {}
+  try { if (statSync(".windsurf").isDirectory()) found.push("windsurf"); } catch {}
+  try { if (statSync(".vscode").isDirectory()) found.push("copilot"); } catch {}
+  try { if (statSync(".codex").isDirectory()) found.push("codex"); } catch {}
+  try { if (statSync(".amazonq").isDirectory()) found.push("amazonq"); } catch {}
+  try { if (statSync(".gemini").isDirectory()) found.push("gemini"); } catch {}
+  return found.length === 1 ? found[0] : null;
 }
 
 export interface ProviderConfig {

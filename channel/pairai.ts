@@ -24,10 +24,22 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateProvider, detectProvider, checkExistingConfig, formatKeyBackupBox, acquireLock, releaseLock, getProviderConfig, localEncrypt as _localEncrypt, localDecrypt as _localDecrypt } from "./lib.js";
 import type { Provider } from "./lib.js";
+import select from "@inquirer/select";
+import input from "@inquirer/input";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf-8"));
 const VERSION: string = PKG.version;
+
+const PROVIDER_CHOICES: { name: string; value: Provider }[] = [
+  { name: "Claude Code", value: "claude" },
+  { name: "Gemini CLI", value: "gemini" },
+  { name: "Cursor", value: "cursor" },
+  { name: "GitHub Copilot (VS Code)", value: "copilot" },
+  { name: "Windsurf", value: "windsurf" },
+  { name: "OpenAI Codex CLI", value: "codex" },
+  { name: "Amazon Q", value: "amazonq" },
+];
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -108,16 +120,39 @@ if (command === "setup") {
       process.exit(1);
     }
   }
-  const provider = (providerArg as Provider) ?? detectProvider();
+  let provider: Provider;
+  if (providerArg) {
+    provider = providerArg as Provider;
+  } else {
+    const detected = detectProvider();
+    if (detected) {
+      provider = detected;
+    } else if (process.stdin.isTTY) {
+      provider = await select({
+        message: "Select your AI tool:",
+        choices: PROVIDER_CHOICES,
+      });
+    } else {
+      console.error('Cannot auto-detect provider. Use --provider flag (e.g. npx pairai setup "My Agent" --provider cursor)');
+      process.exit(1);
+    }
+  }
   const globalIdx = rest.indexOf("--global");
   const useGlobal = globalIdx !== -1 ? (rest.splice(globalIdx, 1), true) : false;
-  const agentName = rest.find((a) => !a.startsWith("--"));
+  let agentName = rest.find((a) => !a.startsWith("--"));
 
   const forceIdx = rest.indexOf("--force");
   const useForce = forceIdx !== -1 ? (rest.splice(forceIdx, 1), true) : false;
   if (!agentName) {
-    console.error('Usage: npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]');
-    process.exit(1);
+    if (process.stdin.isTTY) {
+      agentName = await input({
+        message: 'What should we call your agent? Other agents and users will see this name. (e.g. "Alice\'s Assistant", "Travel Bot")',
+        validate: (v) => v.trim().length > 0 && v.trim().length <= 64 ? true : "Name must be 1-64 characters",
+      });
+    } else {
+      console.error('Usage: npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]');
+      process.exit(1);
+    }
   }
 
   // Check for existing config to avoid accidental overwrites
@@ -342,7 +377,9 @@ async function loadAgentInfo() {
     const me = (await hubGet("/agents/me")) as { id: string; name: string; publicKey?: string };
     myAgentId = me.id;
     myPublicKey = me.publicKey ?? "";
-  } catch {}
+  } catch (err) {
+    console.error("[pairai] failed to load agent info:", (err as Error).message);
+  }
 }
 
 async function loadPublicKeys() {
@@ -351,7 +388,9 @@ async function loadPublicKeys() {
     for (const c of conns) {
       if (c.publicKey) pubKeyCache.set(c.agentId, c.publicKey);
     }
-  } catch {}
+  } catch (err) {
+    console.error("[pairai] failed to load public keys:", (err as Error).message);
+  }
 }
 
 function localEncrypt(plaintext: string, taskId: string, recipientPubKeys: Record<string, string>) {
@@ -478,6 +517,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "pairai_connect_directly",
+      description: "Connect directly to an agent that has auto-accept enabled — no pairing code needed. Use pairai_discover_agents to find agents with autoAccept: true.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          agent_id: { type: "string", description: "ID of the agent to connect with" },
+        },
+        required: ["agent_id"],
+      },
+    },
+    {
       name: "pairai_update_profile",
       description: "Update your agent's profile — name, description, capabilities, and metadata. Returns the updated profile.",
       inputSchema: {
@@ -488,6 +538,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           capabilities: { type: "array", items: { type: "string" }, description: "List of capabilities, e.g. ['scheduling', 'code-review']" },
           metadata: { type: "object", description: "Arbitrary JSON metadata (max 4KB)" },
           discoverable: { type: "boolean", description: "Whether to appear in the public agent directory" },
+          autoAccept: { type: "boolean", description: "Whether to accept direct connections without pairing codes" },
           defaultApprovalRule: { type: "string", enum: ["auto", "require"], description: "Default approval rule for new connections" },
         },
       },
@@ -637,6 +688,78 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           description: { type: "string", description: "Task description (will be encrypted)" },
         },
         required: ["target_agent_id", "title"],
+      },
+    },
+    {
+      name: "pairai_delete_message",
+      description: "Delete (tombstone) a message you sent. The message content is replaced with [deleted].",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task ID" },
+          message_id: { type: "string", description: "Message ID to delete" },
+        },
+        required: ["task_id", "message_id"],
+      },
+    },
+    {
+      name: "pairai_delete_file",
+      description: "Delete a file you uploaded. Removes from disk and tombstones the associated message.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          file_id: { type: "string", description: "File ID to delete" },
+        },
+        required: ["file_id"],
+      },
+    },
+    {
+      name: "pairai_delete_task",
+      description: "Permanently delete a terminal task (completed, failed, cancelled) and all its messages and files.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task ID to delete" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "pairai_rotate_api_key",
+      description: "Generate a new API key. WARNING: old key immediately invalidated. Save the new key before doing anything else.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "pairai_delete_account",
+      description: "PERMANENTLY delete your agent and ALL associated data. IRREVERSIBLE.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
+    {
+      name: "pairai_block_agent",
+      description: "Block an agent. They cannot discover or connect with you. Disconnects if connected.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          agent_id: { type: "string", description: "ID of the agent to block" },
+        },
+        required: ["agent_id"],
+      },
+    },
+    {
+      name: "pairai_unblock_agent",
+      description: "Unblock a previously blocked agent.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          agent_id: { type: "string", description: "ID of the agent to unblock" },
+        },
+        required: ["agent_id"],
       },
     },
   ],
@@ -809,6 +932,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
   }
 
+  if (name === "pairai_connect_directly") {
+    const { agent_id } = args as { agent_id: string };
+    const data = await hubPost(`/connect/${agent_id}`);
+    // Refresh public keys after new connection
+    await loadPublicKeys();
+    return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+  }
+
   if (name === "pairai_update_profile") {
     const body: Record<string, unknown> = {};
     if (args.name !== undefined) body.name = args.name;
@@ -816,6 +947,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (args.capabilities !== undefined) body.capabilities = args.capabilities;
     if (args.metadata !== undefined) body.metadata = args.metadata;
     if (args.discoverable !== undefined) body.discoverable = args.discoverable === "true" || args.discoverable === true;
+    if (args.autoAccept !== undefined) body.autoAccept = args.autoAccept === "true" || args.autoAccept === true;
     if (args.defaultApprovalRule !== undefined) body.defaultApprovalRule = args.defaultApprovalRule;
     const data = await hubPatch("/agents/me", body);
     return { content: [{ type: "text" as const, text: "Profile updated.\n" + JSON.stringify(data, null, 2) }] };
@@ -1110,6 +1242,74 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       senderSignature: signature,
     });
     return { content: [{ type: "text" as const, text: `Encrypted task created. ID: ${taskId}` }] };
+  }
+
+  if (name === "pairai_delete_message") {
+    const { task_id, message_id } = args as { task_id: string; message_id: string };
+    try {
+      await hubDelete(`/tasks/${task_id}/messages/${message_id}`);
+      return { content: [{ type: "text" as const, text: "Message deleted." }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
+  if (name === "pairai_delete_file") {
+    const { file_id } = args as { file_id: string };
+    try {
+      await hubDelete(`/files/${file_id}`);
+      return { content: [{ type: "text" as const, text: "File deleted." }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
+  if (name === "pairai_delete_task") {
+    const { task_id } = args as { task_id: string };
+    try {
+      const result = (await hubDelete(`/tasks/${task_id}`)) as { deletedMessages?: number; deletedFiles?: number };
+      return { content: [{ type: "text" as const, text: `Task deleted. ${result.deletedMessages ?? 0} message(s) and ${result.deletedFiles ?? 0} file(s) removed.` }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
+  if (name === "pairai_rotate_api_key") {
+    try {
+      const result = (await hubPost("/agents/me/rotate-key")) as { apiKey: string };
+      return { content: [{ type: "text" as const, text: `New API key: ${result.apiKey}\n\nWARNING: Your old key is now invalid. Save this key immediately — it will not be shown again.` }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
+  if (name === "pairai_delete_account") {
+    try {
+      await hubDelete("/agents/me");
+      return { content: [{ type: "text" as const, text: "Account deleted." }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
+  if (name === "pairai_block_agent") {
+    const { agent_id } = args as { agent_id: string };
+    try {
+      await hubPost("/agents/me/block", { agentId: agent_id });
+      return { content: [{ type: "text" as const, text: "Agent blocked." }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
+  if (name === "pairai_unblock_agent") {
+    const { agent_id } = args as { agent_id: string };
+    try {
+      await hubDelete(`/agents/me/block/${agent_id}`);
+      return { content: [{ type: "text" as const, text: "Agent unblocked." }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
   }
 
   throw new Error(`Unknown tool: ${name}`);

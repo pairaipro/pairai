@@ -1,6 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { localEncrypt, localDecrypt } from "./lib.js";
+import { mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { localEncrypt, localDecrypt, detectProvider } from "./lib.js";
 
 function makeKeyPair() {
   return generateKeyPairSync("rsa", {
@@ -84,5 +87,65 @@ describe("localEncrypt / localDecrypt", () => {
     expect(() =>
       localDecrypt(result.ciphertext, result.signature, "different-task", alice.publicKey, result.encryptedKeys.bob, bob.privateKey)
     ).toThrow("Signature verification failed");
+  });
+});
+
+describe("detectProvider", () => {
+  const testDir = join(tmpdir(), `pairai-detect-test-${Date.now()}`);
+
+  beforeEach(() => {
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("[REQ-033-01a] returns null when no provider directories exist", () => {
+    const original = process.cwd();
+    process.chdir(testDir);
+    try {
+      delete process.env.GEMINI_CLI;
+      expect(detectProvider()).toBeNull();
+    } finally {
+      process.chdir(original);
+    }
+  });
+
+  it("[REQ-033-01c] returns the single matching provider", () => {
+    const original = process.cwd();
+    mkdirSync(join(testDir, ".cursor"));
+    process.chdir(testDir);
+    try {
+      delete process.env.GEMINI_CLI;
+      expect(detectProvider()).toBe("cursor");
+    } finally {
+      process.chdir(original);
+    }
+  });
+
+  it("[REQ-033-01b] returns null when multiple provider directories exist", () => {
+    const original = process.cwd();
+    mkdirSync(join(testDir, ".cursor"));
+    mkdirSync(join(testDir, ".vscode"));
+    process.chdir(testDir);
+    try {
+      delete process.env.GEMINI_CLI;
+      expect(detectProvider()).toBeNull();
+    } finally {
+      process.chdir(original);
+    }
+  });
+
+  it("[REQ-033-01d] returns gemini when GEMINI_CLI env is set (even with no dirs)", () => {
+    const original = process.cwd();
+    process.chdir(testDir);
+    try {
+      process.env.GEMINI_CLI = "1";
+      expect(detectProvider()).toBe("gemini");
+    } finally {
+      delete process.env.GEMINI_CLI;
+      process.chdir(original);
+    }
   });
 });

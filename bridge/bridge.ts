@@ -136,7 +136,7 @@ if (command === "serve") {
   if (!process.stdin.isTTY) {
     // Non-interactive mode — detect parent death via stdin close
     process.stdin.on("end", () => {
-      log("stdin closed (parent exited). Shutting down.");
+      logFn("stdin closed (parent exited). Shutting down.");
       shutdown();
     });
     process.stdin.resume();
