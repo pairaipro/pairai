@@ -1,6 +1,6 @@
 import { nanoid } from "nanoid";
 import type { HubClient } from "./hub.js";
-import type { ToolDef } from "./openrouter.js";
+import type { ToolDef, OpenRouterClient } from "./openrouter.js";
 
 export interface EncryptFn {
   (plaintext: string, taskId: string, recipientPubKeys: Record<string, string>):
@@ -13,6 +13,8 @@ export interface ToolContext {
   agentId: string;
   encrypt: EncryptFn | undefined;
   pubKeys?: Record<string, string>;
+  openrouter: OpenRouterClient;
+  imageModel?: string;
 }
 
 export function getToolDefs(): ToolDef[] {
@@ -33,10 +35,10 @@ export function getToolDefs(): ToolDef[] {
       type: "function",
       function: {
         name: "update_status",
-        description: "Set task status: working, completed, failed, or input-required",
+        description: "Set task status to input-required when you need more information. Do NOT set completed or failed — the system handles that automatically after your final reply.",
         parameters: {
           type: "object",
-          properties: { status: { type: "string", enum: ["working", "completed", "failed", "input-required"] } },
+          properties: { status: { type: "string", enum: ["working", "input-required"] } },
           required: ["status"],
         },
       },
@@ -168,6 +170,21 @@ export function getToolDefs(): ToolDef[] {
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "generate_image",
+        description: "Generate an image and upload it to the current task as a file attachment. Uses the image generation model configured for this agent.",
+        parameters: {
+          type: "object",
+          properties: {
+            prompt: { type: "string", description: "Detailed description of the image to generate" },
+            filename: { type: "string", description: "Output filename (e.g. 'logo-v1.png')" },
+          },
+          required: ["prompt", "filename"],
+        },
+      },
+    },
   ];
 }
 
@@ -205,6 +222,10 @@ export async function executeTool(
       }
 
       case "update_status": {
+        // Block terminal statuses — the bridge sets these after delivering the reply
+        if (args.status === "completed" || args.status === "failed") {
+          return JSON.stringify({ error: `Do not set status to "${args.status}" directly. Just provide your final reply — the bridge will complete the task automatically.` });
+        }
         const result = await ctx.hub.patch(`/tasks/${ctx.taskId}`, { status: args.status });
         return JSON.stringify(result);
       }
@@ -244,6 +265,24 @@ export async function executeTool(
       }
 
       case "upload_file": {
+        // Check if task is encrypted — encrypt file if so (matches generate_image behavior)
+        const taskData = (await ctx.hub.get(`/tasks/${ctx.taskId}`)) as { encrypted?: boolean };
+        if (taskData.encrypted && ctx.encrypt && ctx.pubKeys) {
+          const envelope = JSON.stringify({
+            filename: args.filename,
+            mimeType: args.mime_type,
+            data: args.base64_content,
+          });
+          const enc = ctx.encrypt(envelope, ctx.taskId, ctx.pubKeys);
+          const result = await ctx.hub.post(`/tasks/${ctx.taskId}/files/json`, {
+            filename: "encrypted_file",
+            mimeType: "application/octet-stream",
+            base64Content: enc.ciphertext,
+            encryptedKeys: enc.encryptedKeys,
+            senderSignature: enc.signature,
+          });
+          return JSON.stringify(result);
+        }
         const result = await ctx.hub.post(`/tasks/${ctx.taskId}/files/json`, {
           filename: args.filename,
           mimeType: args.mime_type,
@@ -296,6 +335,44 @@ export async function executeTool(
       case "disconnect": {
         const result = await ctx.hub.delete(`/connections/${args.connection_id}`);
         return JSON.stringify(result);
+      }
+
+      case "generate_image": {
+        const { prompt, filename } = args as { prompt: string; filename: string };
+        const result = await ctx.openrouter.imageGeneration(ctx.imageModel ?? "google/gemini-3.1-flash-image-preview", prompt);
+        const mime = result.mimeType;
+
+        if (ctx.encrypt && ctx.pubKeys) {
+          const envelope = JSON.stringify({ filename, mimeType: mime, data: result.base64 });
+          const enc = ctx.encrypt(envelope, ctx.taskId, ctx.pubKeys);
+          await ctx.hub.post(`/tasks/${ctx.taskId}/files/json`, {
+            filename,
+            mimeType: mime,
+            base64Content: enc.ciphertext,
+            encryptedKeys: enc.encryptedKeys,
+            senderSignature: enc.signature,
+          });
+        } else {
+          await ctx.hub.post(`/tasks/${ctx.taskId}/files/json`, {
+            filename,
+            mimeType: mime,
+            base64Content: result.base64,
+          });
+        }
+
+        // Report image generation cost
+        if (result.generationId) {
+          try {
+            const cost = await ctx.openrouter.getGenerationCost(result.generationId);
+            if (cost !== null && cost > 0) {
+              await ctx.hub.post(`/tasks/${ctx.taskId}/usage`, { cost });
+            }
+          } catch (err) {
+            console.error(`[bridge] image cost report failed for task ${ctx.taskId}: ${(err as Error).message}`);
+          }
+        }
+
+        return `Image generated and uploaded as "${filename}".${result.revisedPrompt ? ` Revised prompt: ${result.revisedPrompt}` : ""}`;
       }
 
       default:

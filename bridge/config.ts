@@ -7,6 +7,7 @@ export interface BridgeConfig {
   key_file: string;
   openrouter_key: string;
   model: string;
+  image_model?: string;
   temperature: number;
   max_reply_tokens: number;
   max_history_tokens: number;
@@ -63,6 +64,24 @@ export function loadConfig(configPath: string): BridgeConfig {
     if (!merged[field]) {
       throw new Error(`Missing required config field: ${field}`);
     }
+  }
+
+  // Validate types and ranges
+  if (typeof merged.temperature !== "number" || merged.temperature < 0 || merged.temperature > 2) {
+    throw new Error("Invalid config: temperature must be a number between 0 and 2");
+  }
+  if (typeof merged.max_reply_tokens !== "number" || merged.max_reply_tokens < 1) {
+    throw new Error("Invalid config: max_reply_tokens must be a positive number");
+  }
+  if (typeof merged.max_history_tokens !== "number" || merged.max_history_tokens < 1) {
+    throw new Error("Invalid config: max_history_tokens must be a positive number");
+  }
+  if (typeof merged.poll_interval_ms !== "number" || merged.poll_interval_ms < 1000) {
+    throw new Error("Invalid config: poll_interval_ms must be >= 1000");
+  }
+  const validLogLevels = ["debug", "info", "warn", "error"];
+  if (!validLogLevels.includes(merged.log_level as string)) {
+    throw new Error(`Invalid config: log_level must be one of: ${validLogLevels.join(", ")}`);
   }
 
   return merged as BridgeConfig;

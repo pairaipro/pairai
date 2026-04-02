@@ -54,4 +54,18 @@ describe("CLI commands (spec 11)", () => {
     expect(r.stderr).toContain("Unknown command");
     expect(r.code).toBe(1);
   });
+
+  it("[REQ-043-09] --help prints usage and exits 0", () => {
+    const r = run("--help");
+    expect(r.stdout).toContain("Commands:");
+    expect(r.stdout).toContain("setup");
+    expect(r.stdout).toContain("serve");
+    expect(r.code).toBe(0);
+  });
+
+  it("[REQ-043-09] help command prints usage and exits 0", () => {
+    const r = run("help");
+    expect(r.stdout).toContain("Commands:");
+    expect(r.code).toBe(0);
+  });
 });

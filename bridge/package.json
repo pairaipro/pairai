@@ -1,6 +1,6 @@
 {
   "name": "pairai-bridge",
-  "version": "0.1.0",
+  "version": "0.4.3",
   "description": "PairAI OpenRouter Bridge — headless AI agent daemon",
   "type": "module",
   "license": "MIT",
@@ -14,6 +14,7 @@
   ],
   "dependencies": {
     "js-yaml": "^4.1.0",
+    "nanoid": "^5.0.0",
     "tsx": "^4.0.0"
   },
   "devDependencies": {

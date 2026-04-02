@@ -23,6 +23,7 @@ import { OpenRouterClient } from "./openrouter.js";
 import { acquireLock, releaseLock, localDecrypt } from "../channel/lib.js";
 import { pollOnce, processTask, processUnreadMessages, type PollDeps } from "./poll.js";
 import { runSetup } from "./setup.js";
+import { fetchModelPricing } from "./pricing.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf-8"));
@@ -43,6 +44,25 @@ if (command === "version" || args.includes("--version") || args.includes("-v")) 
   process.exit(0);
 }
 
+// ── Help ────────────────────────────────────────────────────────────────────
+
+if (command === "help" || args.includes("--help") || args.includes("-h")) {
+  console.log(`pairai-bridge v${VERSION}\n`);
+  console.log("Commands:");
+  console.log('  setup "Agent Name" [--hub URL] [--config path]  — register a new agent');
+  console.log("  serve [--config path]                           — start the bridge daemon");
+  console.log("  pair <CODE> [--config path]                     — connect with another agent");
+  console.log("  invite [--config path]                          — generate a pairing code");
+  console.log("  version                                         — show version");
+  console.log("\nEnvironment variables:");
+  console.log("  OPENROUTER_API_KEY    OpenRouter API key (required for setup)");
+  console.log("  OPENROUTER_MODEL      Override model from config");
+  console.log("  PAIRAI_HUB_URL        Hub URL override");
+  console.log("  PAIRAI_AGENT_CRED     Agent API key override");
+  console.log("  PAIRAI_KEY_FILE       Private key path override");
+  process.exit(0);
+}
+
 // ── Setup ───────────────────────────────────────────────────────────────────
 
 if (command === "setup") {
@@ -60,11 +80,11 @@ if (command === "setup") {
 
   await runSetup(agentName, hubUrl, configPath);
   process.exit(0);
-}
 
 // ── Serve ───────────────────────────────────────────────────────────────────
 
-if (command === "serve") {
+} else if (command === "serve") {
+  console.log(`[bridge] Starting pairai-bridge v${VERSION} (pid=${process.pid}, node=${process.version}, tty=${!!process.stdin.isTTY})`);
   const configPath = getConfigPath();
   const config = loadConfig(configPath);
   const privateKey = readFileSync(config.key_file.replace(/^~/, homedir()), "utf-8");
@@ -83,6 +103,13 @@ if (command === "serve") {
   if (!acquireLock(agentId)) {
     console.error(`  Another bridge instance is already running for agent ${agentId}. Exiting.`);
     process.exit(0);
+  }
+
+  try {
+    const pricing = await fetchModelPricing(); // URL param available for testing
+    console.error(`[pairai-bridge] Loaded pricing for ${pricing.size} models`);
+  } catch (err) {
+    console.error(`[pairai-bridge] Warning: could not fetch model pricing: ${(err as Error).message}`);
   }
 
   const pubKeys = new Map<string, string>();
@@ -134,12 +161,9 @@ if (command === "serve") {
 
   // ── Console command loop (only when running interactively) ──────────────
   if (!process.stdin.isTTY) {
-    // Non-interactive mode — detect parent death via stdin close
-    process.stdin.on("end", () => {
-      logFn("stdin closed (parent exited). Shutting down.");
-      shutdown();
-    });
-    process.stdin.resume();
+    // Non-interactive / daemon mode — keep alive via poll interval.
+    // stdin may not exist (Docker, k8s) so don't depend on it.
+    logFn("Running in daemon mode (non-interactive). Poll interval: " + config.poll_interval_ms + "ms");
     await new Promise(() => {});
   }
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: "bridge> " });
@@ -357,11 +381,10 @@ if (command === "serve") {
   });
 
   rl.on("close", shutdown);
-}
 
 // ── Pair ────────────────────────────────────────────────────────────────────
 
-if (command === "pair") {
+} else if (command === "pair") {
   const code = args[1];
   if (!code) {
     console.error("Usage: pairai-bridge pair <CODE> [--config path]");
@@ -379,11 +402,10 @@ if (command === "pair") {
     process.exit(1);
   }
   process.exit(0);
-}
 
 // ── Invite ──────────────────────────────────────────────────────────────────
 
-if (command === "invite") {
+} else if (command === "invite") {
   const configPath = getConfigPath();
   const config = loadConfig(configPath);
   const hub = new HubClient(config.hub_url, config.api_key);
@@ -398,11 +420,10 @@ if (command === "invite") {
     process.exit(1);
   }
   process.exit(0);
-}
 
 // ── Unknown ─────────────────────────────────────────────────────────────────
 
-if (!["setup", "serve", "pair", "invite"].includes(command ?? "")) {
+} else {
   console.error(`Unknown command: ${command ?? "(none)"}`);
   console.error("Usage: pairai-bridge <setup|serve|pair|invite|version>");
   process.exit(1);

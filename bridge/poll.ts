@@ -4,6 +4,7 @@ import type { OpenRouterClient, ChatMessage } from "./openrouter.js";
 import { buildMessages, type TaskMessage } from "./context.js";
 import { getToolDefs, executeTool, type ToolContext } from "./tools.js";
 import { localEncrypt, localDecrypt } from "../channel/lib.js";
+import { computeCost } from "./pricing.js";
 
 const MAX_TOOL_CALLS = 10;
 
@@ -39,6 +40,11 @@ export interface PollDeps {
   myPublicKey: string;
   pubKeys: Map<string, string>;
   log: (msg: string) => void;
+}
+
+/** Prefixed logger for a specific task */
+function taskLog(deps: PollDeps, taskId: string, phase: string, msg: string) {
+  deps.log(`[task:${taskId}] [${phase}] ${msg}`);
 }
 
 function otherAgentId(task: HubTask, myId: string): string {
@@ -103,6 +109,14 @@ class ToolCallLimitError extends Error {
   }
 }
 
+function sanitizeError(rawMsg: string): string {
+  const truncated = rawMsg.length > 200 ? rawMsg.slice(0, 200) + "..." : rawMsg;
+  return truncated
+    .replace(/sk-[a-zA-Z0-9_-]{10,}/g, "sk-***")
+    .replace(/or-[a-zA-Z0-9_-]{10,}/g, "or-***")
+    .replace(/Bearer\s+[^\s"]{20,}/g, "Bearer ***");
+}
+
 async function callOpenRouterWithTools(
   messages: ChatMessage[],
   deps: PollDeps,
@@ -110,8 +124,10 @@ async function callOpenRouterWithTools(
 ): Promise<string> {
   const tools = getToolDefs();
   const currentMessages = [...messages];
+  const tid = toolCtx.taskId;
 
   for (let round = 0; round <= MAX_TOOL_CALLS; round++) {
+    taskLog(deps, tid, "model", `round=${round} messages=${currentMessages.length} tools=${tools.length} model=${deps.config.model}`);
     const result = await deps.openrouter.chatCompletion(
       deps.config.model,
       currentMessages,
@@ -120,8 +136,35 @@ async function callOpenRouterWithTools(
     );
 
     const msg = result.message;
+    const contentLen = (typeof msg.content === "string" ? msg.content?.length : 0) ?? 0;
+    taskLog(deps, tid, "model", `finish_reason=${result.finish_reason} tool_calls=${msg.tool_calls?.length ?? 0} content=${contentLen}chars prompt=${result.usage.prompt_tokens} completion=${result.usage.completion_tokens} gen=${result.generationId ?? "none"}`);
+
+    // Report actual cost from OpenRouter generation endpoint (falls back to local estimate)
+    if (result.generationId) {
+      try {
+        const realCost = await deps.openrouter.getGenerationCost(result.generationId);
+        const cost = realCost ?? computeCost(deps.config.model, result.usage.prompt_tokens, result.usage.completion_tokens);
+        if (cost !== null && cost > 0) {
+          await deps.hub.post(`/tasks/${tid}/usage`, { cost });
+          taskLog(deps, tid, "usage", `reported $${cost.toFixed(6)} ${realCost !== null ? "(actual from OpenRouter)" : "(estimated from cached pricing)"} gen=${result.generationId}`);
+        }
+      } catch (err) {
+        taskLog(deps, tid, "usage", `FAILED to report cost: ${(err as Error).message}`);
+      }
+    } else {
+      const cost = computeCost(deps.config.model, result.usage.prompt_tokens, result.usage.completion_tokens);
+      if (cost !== null && cost > 0) {
+        try {
+          await deps.hub.post(`/tasks/${tid}/usage`, { cost });
+          taskLog(deps, tid, "usage", `reported $${cost.toFixed(6)} (estimated, no generation ID returned)`);
+        } catch (err) {
+          taskLog(deps, tid, "usage", `FAILED to report cost: ${(err as Error).message}`);
+        }
+      }
+    }
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      taskLog(deps, tid, "model", `final response: ${contentLen} chars (no tool calls)`);
       return msg.content ?? "";
     }
 
@@ -131,7 +174,11 @@ async function callOpenRouterWithTools(
 
     currentMessages.push(msg);
     for (const tc of msg.tool_calls) {
+      const argsPreview = tc.function.arguments.length > 200 ? tc.function.arguments.slice(0, 200) + "..." : tc.function.arguments;
+      taskLog(deps, tid, "tool", `calling ${tc.function.name}(${argsPreview})`);
       const toolResult = await executeTool(tc.function.name, tc.function.arguments, toolCtx);
+      const resultPreview = toolResult.length > 300 ? toolResult.slice(0, 300) + "..." : toolResult;
+      taskLog(deps, tid, "tool", `${tc.function.name} returned ${toolResult.length} chars: ${resultPreview}`);
       currentMessages.push({
         role: "tool",
         content: toolResult,
@@ -232,28 +279,32 @@ async function fetchTaskWithMessages(taskId: string, deps: PollDeps): Promise<Hu
 }
 
 export async function processTask(taskId: string, deps: PollDeps): Promise<void> {
-  deps.log(`Received task ${taskId} — fetching details...`);
+  taskLog(deps, taskId, "fetch", "new task received, fetching details from hub");
   const task = await fetchTaskWithMessages(taskId, deps);
   const otherId = otherAgentId(task, deps.agentId);
+  taskLog(deps, taskId, "fetch", `title="${task.title}" status=${task.status} encrypted=${!!task.encrypted} from=${task.initiatorAgentId} messages=${task.messages.length}`);
 
   // Auto-accept: set to working
   try {
     await deps.hub.patch(`/tasks/${taskId}`, { status: "working" });
-    deps.log(`Task ${taskId} — status set to "working"`);
-  } catch {
-    // May already be in a different status
+    taskLog(deps, taskId, "status", "set to working");
+  } catch (err) {
+    taskLog(deps, taskId, "status", `failed to set working (may already be in another state): ${(err as Error).message}`);
   }
 
   // Decrypt
   const description = task.encrypted && deps.privateKey
     ? decryptTaskDescription(task, deps.agentId, deps.myPublicKey, deps.privateKey, deps.pubKeys)
     : task.description ?? "";
-  if (task.encrypted) deps.log(`Task ${taskId} — decrypted${deps.privateKey ? "" : " (no private key, raw)"}`);
+  if (task.encrypted) {
+    taskLog(deps, taskId, "decrypt", deps.privateKey ? `decrypted task description (${description.length} chars)` : "no private key, using raw ciphertext");
+  }
   const decryptedMessages = decryptMessages(task, deps);
+  taskLog(deps, taskId, "decrypt", `${decryptedMessages.length} message(s) decrypted`);
 
   // Resolve sender
   const sender = await resolveSender(deps, otherId);
-  deps.log(`Task ${taskId} — "${task.title}" from ${sender.name}, ${decryptedMessages.length} message(s)`);
+  taskLog(deps, taskId, "context", `sender="${sender.name}" capabilities=${JSON.stringify(sender.capabilities ?? [])}`);
   const taskData = buildTaskData(task, description, sender.name, sender.description, sender.capabilities);
 
   const messages = buildMessages(
@@ -263,8 +314,10 @@ export async function processTask(taskId: string, deps: PollDeps): Promise<void>
     deps.agentId,
     deps.config.max_history_tokens,
   );
+  taskLog(deps, taskId, "context", `built ${messages.length} messages for model (max_history_tokens=${deps.config.max_history_tokens})`);
 
   const { encryptFn, pubKeysObj } = buildEncryptionContext(task, deps, otherId);
+  if (encryptFn) taskLog(deps, taskId, "crypto", `encryption enabled, ${Object.keys(pubKeysObj ?? {}).length} public keys`);
 
   const toolCtx: ToolContext = {
     hub: deps.hub,
@@ -272,57 +325,68 @@ export async function processTask(taskId: string, deps: PollDeps): Promise<void>
     agentId: deps.agentId,
     encrypt: encryptFn,
     pubKeys: pubKeysObj,
+    openrouter: deps.openrouter,
+    imageModel: deps.config.image_model,
   };
 
   try {
-    deps.log(`Task ${taskId} — sending to model (${deps.config.model})...`);
+    taskLog(deps, taskId, "model", `sending to ${deps.config.model} (temp=${deps.config.temperature}, max_tokens=${deps.config.max_reply_tokens})`);
     const reply = await callOpenRouterWithTools(messages, deps, toolCtx);
     if (reply) {
-      deps.log(`Task ${taskId} — got reply (${reply.length} chars), sending to hub${encryptFn ? " (encrypted)" : ""}...`);
+      taskLog(deps, taskId, "reply", `got ${reply.length} chars, delivering to hub${encryptFn ? " (encrypted)" : ""}`);
       await sendReplyOrError(taskId, reply, encryptFn, pubKeysObj, deps);
-      deps.log(`Task ${taskId} — reply delivered`);
+      taskLog(deps, taskId, "reply", "delivered successfully");
+      // Auto-complete: reply delivered successfully → mark task done
+      try {
+        await deps.hub.patch(`/tasks/${taskId}`, { status: "completed" });
+        taskLog(deps, taskId, "status", "set to completed (auto-complete after reply)");
+      } catch {
+        taskLog(deps, taskId, "status", "failed to set completed (may already be terminal)");
+      }
     } else {
-      deps.log(`Task ${taskId} — model returned empty response`);
+      taskLog(deps, taskId, "reply", "WARNING: model returned empty response, no reply sent");
     }
   } catch (err) {
     // Sanitize error messages — strip raw API error bodies that may contain keys
     const rawMsg = (err as Error).message ?? "unknown error";
-    const safeMsg = rawMsg.length > 200 ? rawMsg.slice(0, 200) + "..." : rawMsg;
     const errMsg = err instanceof ToolCallLimitError
       ? `[Bridge error] Tool call limit exceeded — possible loop`
-      : `[Bridge error] ${safeMsg.replace(/sk-[a-zA-Z0-9_-]+/g, "sk-***")}`;
-    deps.log(`Task ${taskId} — ERROR: ${errMsg}`);
+      : `[Bridge error] ${sanitizeError(rawMsg)}`;
+    taskLog(deps, taskId, "error", errMsg);
 
     try {
-      await deps.hub.post(`/tasks/${taskId}/messages`, { content: errMsg, contentType: "text" });
+      taskLog(deps, taskId, "error", `sending error message to hub${encryptFn ? " (encrypted)" : ""}`);
+      await sendReplyOrError(taskId, errMsg, encryptFn, pubKeysObj, deps);
       await deps.hub.patch(`/tasks/${taskId}`, { status: "input-required" });
-      deps.log(`Task ${taskId} — error reported to hub, status set to "input-required"`);
-    } catch {
-      deps.log(`Task ${taskId} — failed to report error to hub: ${(err as Error).message}`);
+      taskLog(deps, taskId, "error", "error delivered, status set to input-required");
+    } catch (reportErr) {
+      taskLog(deps, taskId, "error", `FAILED to report error to hub: ${(reportErr as Error).message}`);
     }
   }
 }
 
 export async function processUnreadMessages(taskId: string, deps: PollDeps): Promise<void> {
-  deps.log(`New message(s) on task ${taskId} — fetching history...`);
+  taskLog(deps, taskId, "fetch", "new message(s) received, fetching history from hub");
   const task = await fetchTaskWithMessages(taskId, deps);
 
   // Skip if the latest message is from us — nothing new to respond to
   const lastMsg = task.messages[task.messages.length - 1];
   if (lastMsg && lastMsg.senderAgentId === deps.agentId) {
-    deps.log(`Task ${taskId} — last message is ours, skipping`);
+    taskLog(deps, taskId, "skip", "last message is ours, nothing to respond to");
     return;
   }
 
   const otherId = otherAgentId(task, deps.agentId);
+  taskLog(deps, taskId, "fetch", `title="${task.title}" status=${task.status} encrypted=${!!task.encrypted} messages=${task.messages.length}`);
 
   const description = task.encrypted && deps.privateKey
     ? decryptTaskDescription(task, deps.agentId, deps.myPublicKey, deps.privateKey, deps.pubKeys)
     : task.description ?? "";
   const decryptedMessages = decryptMessages(task, deps);
-  deps.log(`Task ${taskId} — ${decryptedMessages.length} message(s) in history`);
+  taskLog(deps, taskId, "decrypt", `${decryptedMessages.length} message(s) in history`);
 
   const sender = await resolveSender(deps, otherId);
+  taskLog(deps, taskId, "context", `sender="${sender.name}"`);
   const taskData = buildTaskData(task, description, sender.name, sender.description, sender.capabilities);
 
   const messages = buildMessages(
@@ -332,6 +396,7 @@ export async function processUnreadMessages(taskId: string, deps: PollDeps): Pro
     deps.agentId,
     deps.config.max_history_tokens,
   );
+  taskLog(deps, taskId, "context", `built ${messages.length} messages for model`);
 
   const { encryptFn, pubKeysObj } = buildEncryptionContext(task, deps, otherId);
 
@@ -341,33 +406,35 @@ export async function processUnreadMessages(taskId: string, deps: PollDeps): Pro
     agentId: deps.agentId,
     encrypt: encryptFn,
     pubKeys: pubKeysObj,
+    openrouter: deps.openrouter,
+    imageModel: deps.config.image_model,
   };
 
   try {
-    deps.log(`Task ${taskId} — sending to model (${deps.config.model})...`);
+    taskLog(deps, taskId, "model", `sending to ${deps.config.model}`);
     const reply = await callOpenRouterWithTools(messages, deps, toolCtx);
     if (reply) {
-      deps.log(`Task ${taskId} — got reply (${reply.length} chars), sending to hub${encryptFn ? " (encrypted)" : ""}...`);
+      taskLog(deps, taskId, "reply", `got ${reply.length} chars, delivering to hub${encryptFn ? " (encrypted)" : ""}`);
       await sendReplyOrError(taskId, reply, encryptFn, pubKeysObj, deps);
-      deps.log(`Task ${taskId} — reply delivered`);
+      taskLog(deps, taskId, "reply", "delivered successfully");
     } else {
-      deps.log(`Task ${taskId} — model returned empty response`);
+      taskLog(deps, taskId, "reply", "WARNING: model returned empty response, no reply sent");
     }
   } catch (err) {
     // Sanitize error messages — strip raw API error bodies that may contain keys
     const rawMsg = (err as Error).message ?? "unknown error";
-    const safeMsg = rawMsg.length > 200 ? rawMsg.slice(0, 200) + "..." : rawMsg;
     const errMsg = err instanceof ToolCallLimitError
       ? `[Bridge error] Tool call limit exceeded — possible loop`
-      : `[Bridge error] ${safeMsg.replace(/sk-[a-zA-Z0-9_-]+/g, "sk-***")}`;
-    deps.log(`Task ${taskId} — ERROR: ${errMsg}`);
+      : `[Bridge error] ${sanitizeError(rawMsg)}`;
+    taskLog(deps, taskId, "error", errMsg);
 
     try {
-      await deps.hub.post(`/tasks/${taskId}/messages`, { content: errMsg, contentType: "text" });
+      taskLog(deps, taskId, "error", `sending error message to hub${encryptFn ? " (encrypted)" : ""}`);
+      await sendReplyOrError(taskId, errMsg, encryptFn, pubKeysObj, deps);
       await deps.hub.patch(`/tasks/${taskId}`, { status: "input-required" });
-      deps.log(`Task ${taskId} — error reported to hub, status set to "input-required"`);
-    } catch {
-      deps.log(`Task ${taskId} — failed to report error to hub: ${(err as Error).message}`);
+      taskLog(deps, taskId, "error", "error delivered, status set to input-required");
+    } catch (reportErr) {
+      taskLog(deps, taskId, "error", `FAILED to report error to hub: ${(reportErr as Error).message}`);
     }
   }
 }
@@ -390,22 +457,28 @@ export async function pollOnce(deps: PollDeps, seenTasks: Set<string>): Promise<
 
   if (!updates.hasUpdates) return;
 
+  deps.log(`[poll] ${updates.pendingTasks.length} pending task(s), ${updates.unreadMessages.length} unread message(s)`);
+
   for (const t of updates.pendingTasks) {
     if (seenTasks.has(t.id)) continue;
     seenTasks.add(t.id);
-    deps.log(`Processing new task: ${t.id}`);
+    deps.log(`[poll] dispatching new task ${t.id}`);
     await processTask(t.id, deps);
   }
 
   for (const u of updates.unreadMessages) {
-    deps.log(`Processing unread messages for task: ${u.taskId}`);
+    deps.log(`[poll] dispatching unread messages for task ${u.taskId}`);
     await processUnreadMessages(u.taskId, deps);
   }
 
-  // Do NOT ack the hub here. The seenTasks Set prevents re-processing within
-  // this session. The hub's lastSeenRowid should only advance via explicit user
-  // action, not automatically — prevents message loss if bridge crashes mid-processing.
-  // (See v0.3.2 poll-ack race fix in channel/pairai.ts)
+  // Ack the hub cursor so it stops re-delivering the same updates.
+  // The bridge processes synchronously — if it crashes mid-processing, it hasn't
+  // acked yet, so the hub will re-deliver on next poll. Safe to ack after processing.
+  try {
+    await deps.hub.post("/updates/ack", { cursor: updates.cursor });
+  } catch {
+    // Non-fatal — worst case is re-delivery on next poll
+  }
 
   // GC seen set — delete only excess entries (not bulk 5000)
   if (seenTasks.size > 10_000) {

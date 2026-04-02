@@ -1,77 +1,106 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { createServer } from "node:http";
-import type { Server } from "node:http";
-import { OpenRouterClient, type ChatMessage, type ToolDef } from "./openrouter.js";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { OpenRouterClient } from "./openrouter.js";
 
-let server: Server;
-let port: number;
-let lastBody: Record<string, unknown>;
+describe("imageGeneration", () => {
+  let client: OpenRouterClient;
 
-beforeAll(async () => {
-  server = createServer(async (req, res) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    lastBody = JSON.parse(Buffer.concat(chunks).toString());
+  beforeEach(() => {
+    client = new OpenRouterClient("test-key");
+  });
 
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+  it("extracts image from message.images[] (OpenRouter format)", async () => {
+    const mockResponse = {
       choices: [{
-        message: { role: "assistant", content: "Hello back!" },
-        finish_reason: "stop",
+        message: {
+          content: null,
+          images: [
+            { type: "image_url", image_url: { url: "data:image/jpeg;base64,/9j/4AAQ=" } },
+          ],
+        },
       }],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-    }));
-  });
-  await new Promise<void>((resolve) => {
-    server.listen(0, () => {
-      port = (server.address() as { port: number }).port;
-      resolve();
-    });
-  });
-});
+    };
 
-afterAll(() => server.close());
-
-describe("OpenRouterClient", () => {
-  it("sends chat completion request with correct format", async () => {
-    const client = new OpenRouterClient("sk-or-test", `http://localhost:${port}`);
-    const messages: ChatMessage[] = [
-      { role: "system", content: "You are helpful." },
-      { role: "user", content: "Hi" },
-    ];
-
-    const result = await client.chatCompletion("openai/gpt-4o", messages, {
-      temperature: 0.5,
-      max_tokens: 100,
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(mockResponse),
     });
 
-    expect(lastBody.model).toBe("openai/gpt-4o");
-    expect(lastBody.messages).toEqual(messages);
-    expect(lastBody.temperature).toBe(0.5);
-    expect(lastBody.max_tokens).toBe(100);
-    expect(result.message.content).toBe("Hello back!");
-    expect(result.usage.total_tokens).toBe(15);
+    const result = await client.imageGeneration("google/gemini-3.1-flash-image-preview", "a blue logo");
+
+    expect(result.base64).toBe("/9j/4AAQ=");
+    expect(result.revisedPrompt).toBeUndefined();
+
+    const call = (fetch as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(call[0]).toContain("/chat/completions");
+    const body = JSON.parse(call[1].body);
+    expect(body.model).toBe("google/gemini-3.1-flash-image-preview");
+    expect(body.modalities).toEqual(["image", "text"]);
   });
 
-  it("includes tools when provided", async () => {
-    const client = new OpenRouterClient("sk-or-test", `http://localhost:${port}`);
-    const tools: ToolDef[] = [{
-      type: "function",
-      function: {
-        name: "reply",
-        description: "Send a reply",
-        parameters: { type: "object", properties: { message: { type: "string" } }, required: ["message"] },
-      },
-    }];
+  it("extracts image from content[] (inline format)", async () => {
+    const mockResponse = {
+      choices: [{
+        message: {
+          content: [
+            { type: "text", text: "Here is your logo" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+          ],
+        },
+      }],
+    };
 
-    await client.chatCompletion("openai/gpt-4o", [{ role: "user", content: "Hi" }], {}, tools);
-    expect(lastBody.tools).toEqual(tools);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(mockResponse),
+    });
+
+    const result = await client.imageGeneration("test-model", "a blue logo");
+
+    expect(result.base64).toBe("iVBORw0KGgo=");
+    expect(result.revisedPrompt).toBe("Here is your logo");
   });
 
-  it("returns result correctly", async () => {
-    const client = new OpenRouterClient("sk-or-test", `http://localhost:${port}`);
-    const result = await client.chatCompletion("openai/gpt-4o", [{ role: "user", content: "test" }]);
-    expect(result.message.content).toBe("Hello back!");
-    expect(result.finish_reason).toBe("stop");
+  it("throws on API error", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: () => Promise.resolve("bad request"),
+    });
+
+    await expect(client.imageGeneration("test-model", "test")).rejects.toThrow("OpenRouter API error 400");
+  });
+
+  it("throws when no image in response", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ choices: [{ message: { content: "just text" } }] }),
+    });
+
+    await expect(client.imageGeneration("test-model", "test")).rejects.toThrow("no image data");
+  });
+
+  it("[REQ-043-01] throws on 200-status model error (data.error)", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        error: { code: 503, message: "Model overloaded" },
+      }),
+    });
+
+    await expect(client.imageGeneration("test-model", "test")).rejects.toThrow("OpenRouter model error: Model overloaded (code 503)");
+  });
+
+  it("[REQ-043-01] throws on per-choice error", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        choices: [{
+          message: { content: null },
+          error: { code: 400, message: "Content policy violation" },
+        }],
+      }),
+    });
+
+    await expect(client.imageGeneration("test-model", "test")).rejects.toThrow("OpenRouter choice error: Content policy violation (code 400)");
   });
 });

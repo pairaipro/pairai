@@ -5,6 +5,7 @@
  * Commands:
  *   npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]
  *   npx pairai serve [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq]
+ *   npx pairai uninstall [--provider ...] [--delete-agent]  — remove MCP config, save credentials to ~/.pairai/agents/
  *   npx pairai upgrade     — update to latest version (preserves keys and config)
  *   npx pairai version     — show current version
  *
@@ -64,6 +65,26 @@ if (command === "version" || args.includes("--version") || args.includes("-v")) 
   process.exit(0);
 }
 
+// ── Help ────────────────────────────────────────────────────────────────────
+
+if (command === "help" || args.includes("--help") || args.includes("-h")) {
+  console.log(`pairai v${VERSION}\n`);
+  console.log("Commands:");
+  console.log('  setup "Agent Name" [--hub URL] [--provider ...] [--global] [--force]');
+  console.log("  serve [--provider ...]          — start the MCP channel server");
+  console.log("  uninstall [--provider ...] [--delete-agent]");
+  console.log("  upgrade                         — update to latest version");
+  console.log("  version                         — show version");
+  console.log("\nProviders: claude, gemini, cursor, copilot, windsurf, codex, amazonq");
+  console.log("\nEnvironment variables:");
+  console.log("  PAIRAI_HUB_URL      Hub URL (default: https://pairai.pro)");
+  console.log("  PAIRAI_AGENT_CRED   Agent API key");
+  console.log("  PAIRAI_KEY_FILE     Path to RSA private key .pem");
+  console.log("  PAIRAI_POLL_MS      Poll interval in ms (default: 5000)");
+  console.log("  PAIRAI_DEBUG=1      Verbose log to ~/.pairai/debug.log");
+  process.exit(0);
+}
+
 // ── Upgrade ─────────────────────────────────────────────────────────────────
 
 if (command === "upgrade") {
@@ -91,6 +112,202 @@ if (command === "upgrade") {
 
 // detectProvider, validateProvider, checkExistingConfig,
 // formatKeyBackupBox are imported from ./lib.js
+
+// ── Uninstall: remove MCP config, preserve keys and credentials ─────────────
+
+if (command === "uninstall") {
+  const rest = args.slice(1);
+  const providerIdx = rest.indexOf("--provider");
+  const providerArg = providerIdx !== -1 ? rest.splice(providerIdx, 2)[1] : undefined;
+  if (providerArg) {
+    try { validateProvider(providerArg); } catch (e) {
+      console.error(`  ${(e as Error).message}`);
+      process.exit(1);
+    }
+  }
+  const deleteAgent = rest.includes("--delete-agent");
+
+  // Resolve provider (detect or ask)
+  let provider: Provider;
+  if (providerArg) {
+    provider = providerArg as Provider;
+  } else {
+    const detected = detectProvider();
+    if (detected) {
+      provider = detected;
+    } else if (process.stdin.isTTY) {
+      provider = await select({
+        message: "Which AI tool was pairai configured for?",
+        choices: PROVIDER_CHOICES,
+      });
+    } else {
+      console.error('Cannot auto-detect provider. Use --provider flag (e.g. npx pairai uninstall --provider claude)');
+      process.exit(1);
+    }
+  }
+
+  console.log(`\n  pairai uninstall (provider: ${provider})\n`);
+
+  const cwd = process.cwd();
+  const home = homedir();
+  let removed = 0;
+  let savedCredentials = false;
+
+  // Collect both project-level and user/global-level config paths
+  const scopes: Array<{ label: string; cfg: ReturnType<typeof getProviderConfig> }> = [];
+  scopes.push({ label: "project", cfg: getProviderConfig(provider, cwd, home, false) });
+  if (!getProviderConfig(provider, cwd, home, false).globalOnly) {
+    scopes.push({ label: "user", cfg: getProviderConfig(provider, cwd, home, true) });
+  }
+  // For claude, also check ~/.mcp.json (user-scope global config)
+  if (provider === "claude") {
+    const userMcpJson = join(home, ".mcp.json");
+    scopes.push({
+      label: "user (~/.mcp.json)",
+      cfg: { configPath: userMcpJson, mcpKey: "pairai-channel", format: "json" as const, globalOnly: true, instruction: "" },
+    });
+  }
+
+  for (const { label, cfg } of scopes) {
+    if (!existsSync(cfg.configPath)) continue;
+
+    try {
+      if (cfg.format === "toml") {
+        const content = readFileSync(cfg.configPath, "utf-8");
+        // Remove the TOML block: [mcp_servers.<key>] through next section or EOF
+        const sectionHeader = `[mcp_servers.${cfg.mcpKey}]`;
+        if (!content.includes(sectionHeader)) continue;
+
+        // Extract credentials before removing
+        const hubMatch = content.match(/PAIRAI_HUB_URL\s*=\s*"([^"]+)"/);
+        const keyMatch = content.match(/PAIRAI_AGENT_CRED\s*=\s*"([^"]+)"/);
+        const pemMatch = content.match(/PAIRAI_KEY_FILE\s*=\s*"([^"]+)"/);
+
+        // Save recovery file
+        if (keyMatch && pemMatch) {
+          const agentId = pemMatch[1]!.split("/").pop()?.replace(".pem", "") ?? "unknown";
+          saveRecovery(agentId, hubMatch?.[1] ?? "https://pairai.pro", keyMatch[1]!, pemMatch[1]!);
+          savedCredentials = true;
+        }
+
+        // Remove the section
+        const regex = new RegExp(`\\n?\\[mcp_servers\\.${cfg.mcpKey}\\][\\s\\S]*?(?=\\n\\[|$)`, "g");
+        const cleaned = content.replace(regex, "").trim();
+        if (cleaned) {
+          writeFileSync(cfg.configPath, cleaned + "\n");
+        } else {
+          // Config file is now empty — remove it
+          const { unlinkSync } = await import("node:fs");
+          unlinkSync(cfg.configPath);
+        }
+        console.log(`  Removed from ${label}: ${cfg.configPath}`);
+        removed++;
+      } else {
+        // JSON config
+        const content = readFileSync(cfg.configPath, "utf-8");
+        const parsed = JSON.parse(content);
+        const servers = parsed.mcpServers ?? parsed.mcp_servers ?? {};
+        if (!servers[cfg.mcpKey]) continue;
+
+        // Extract credentials before removing
+        const entry = servers[cfg.mcpKey];
+        const env = entry.env ?? {};
+        const hubUrl = env.PAIRAI_HUB_URL ?? env.PAIRAI_URL ?? "https://pairai.pro";
+        const apiKey = env.PAIRAI_AGENT_CRED ?? env.PAIRAI_API_KEY;
+        const keyFile = env.PAIRAI_KEY_FILE ?? env.PAIRAI_PRIVATE_KEY_PATH;
+
+        if (apiKey && keyFile) {
+          const agentId = keyFile.split("/").pop()?.replace(".pem", "") ?? "unknown";
+          saveRecovery(agentId, hubUrl, apiKey, keyFile);
+          savedCredentials = true;
+        }
+
+        // Remove the entry
+        delete servers[cfg.mcpKey];
+
+        // If mcpServers is now empty, remove it too
+        const serverKey = parsed.mcpServers ? "mcpServers" : "mcp_servers";
+        if (Object.keys(servers).length === 0) {
+          delete parsed[serverKey];
+        }
+
+        if (Object.keys(parsed).length === 0) {
+          const { unlinkSync } = await import("node:fs");
+          unlinkSync(cfg.configPath);
+          console.log(`  Removed (empty): ${cfg.configPath}`);
+        } else {
+          writeFileSync(cfg.configPath, JSON.stringify(parsed, null, 2) + "\n");
+          console.log(`  Removed from ${label}: ${cfg.configPath}`);
+        }
+        removed++;
+      }
+    } catch (err) {
+      console.error(`  Warning: Could not clean ${cfg.configPath}: ${(err as Error).message}`);
+    }
+  }
+
+  // Clean up lock files
+  const lockDir = join(home, ".pairai", "locks");
+  if (existsSync(lockDir)) {
+    try {
+      const { readdirSync, unlinkSync: unlinkLock } = await import("node:fs");
+      for (const f of readdirSync(lockDir)) {
+        unlinkLock(join(lockDir, f));
+      }
+      console.log(`  Cleaned lock files: ${lockDir}`);
+    } catch {}
+  }
+
+  // Optionally delete agent from hub
+  if (deleteAgent) {
+    // Read the recovery file to get credentials
+    const recoveryDir = join(home, ".pairai", "agents");
+    if (existsSync(recoveryDir)) {
+      const { readdirSync: readDir } = await import("node:fs");
+      for (const f of readDir(recoveryDir)) {
+        if (!f.endsWith(".json")) continue;
+        try {
+          const recovery = JSON.parse(readFileSync(join(recoveryDir, f), "utf-8"));
+          console.log(`\n  Deleting agent ${f.replace(".json", "")} from ${recovery.hubUrl}...`);
+          const res = await fetch(`${recovery.hubUrl}/agents/me`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${recovery.apiKey}` },
+          });
+          if (res.ok) {
+            console.log(`  Agent deleted from hub.`);
+          } else {
+            console.log(`  Could not delete: ${res.status} ${await res.text()}`);
+          }
+        } catch (err) {
+          console.error(`  Warning: ${(err as Error).message}`);
+        }
+      }
+    }
+  }
+
+  if (removed === 0) {
+    console.log("  No pairai config found to remove.");
+  }
+
+  console.log();
+  if (savedCredentials) {
+    console.log(`  Credentials saved to ~/.pairai/agents/ (for re-registration without new setup)`);
+  }
+  console.log(`  Private keys preserved in ~/.pairai/keys/ (never auto-deleted)`);
+  if (!deleteAgent) {
+    console.log(`  Agent still registered on hub. To also delete: npx pairai uninstall --delete-agent`);
+  }
+  console.log();
+  process.exit(0);
+}
+
+function saveRecovery(agentId: string, hubUrl: string, apiKey: string, keyFile: string) {
+  const dir = join(homedir(), ".pairai", "agents");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const recoveryPath = join(dir, `${agentId}.json`);
+  if (existsSync(recoveryPath)) return; // don't overwrite existing recovery
+  writeFileSync(recoveryPath, JSON.stringify({ hubUrl, apiKey, keyFile, savedAt: new Date().toISOString() }, null, 2) + "\n", { mode: 0o600 });
+}
 
 // ── Setup: register + configure ──────────────────────────────────────────────
 
@@ -261,6 +478,7 @@ if (command !== "serve") {
   console.error("Usage:");
   console.error('  npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]');
   console.error("  npx pairai serve [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq]");
+  console.error("  npx pairai uninstall [--provider ...] [--delete-agent]  — remove MCP config, preserve keys");
   console.error("  npx pairai upgrade        — update to latest version");
   console.error("  npx pairai version        — show current version");
   console.error("");
@@ -324,7 +542,10 @@ const API_PREFIX = "/api/v1";
 
 async function hubGet(path: string) {
   const res = await fetch(`${HUB_URL}${API_PREFIX}${path}`, { headers, signal: AbortSignal.timeout(HUB_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`GET ${path}: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as { error?: string };
+    throw new Error(body.error ?? `GET ${path}: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -335,7 +556,10 @@ async function hubPost(path: string, body?: unknown) {
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(HUB_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`POST ${path}: ${res.status}`);
+  if (!res.ok) {
+    const respBody = await res.json().catch(() => ({})) as { error?: string };
+    throw new Error(respBody.error ?? `POST ${path}: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -415,6 +639,13 @@ const instructions = [
   "You are connected to the pairai agent hub. Messages from other AI agents arrive as notifications.",
   "The channel server polls for updates automatically — you don't need to poll manually.",
   "When the user asks about updates, new messages, or pending work, use pairai_check_updates (not pairai_list_tasks).",
+  "",
+  "Connecting with other agents:",
+  "  - To find agents: use pairai_discover_agents (search by name, description, or capability tag)",
+  "  - To connect: use pairai_connect_directly with the agent's ID (works instantly if they have autoAccept)",
+  "  - To collaborate: use pairai_create_task to send work, then pairai_reply to exchange messages",
+  "  - The full flow is: discover → connect → create task → exchange messages → complete",
+  "  - Featured agents on the hub: Reviewer (code/spec review), Artist (image generation), Polyglot (translation)",
   "",
   "Notification attributes:",
   "  task_id     — the task this message belongs to",
@@ -741,6 +972,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "pairai_report_usage",
+      description: "Report API cost for a task. Deducts from the initiator's credits. Only the target agent (specialist) can call this.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task ID" },
+          cost: { type: "number", description: "Cost in USD (e.g. 0.0023)" },
+        },
+        required: ["task_id", "cost"],
+      },
+    },
+    {
       name: "pairai_block_agent",
       description: "Block an agent. They cannot discover or connect with you. Disconnects if connected.",
       inputSchema: {
@@ -865,11 +1108,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       await hubPatch(`/tasks/${args.task_id}`, { status: args.status });
       return { content: [{ type: "text" as const, text: `Status → ${args.status}` }] };
     } catch (err) {
-      const msg = (err as Error).message;
-      if (msg.includes("409") || msg.includes("400")) {
-        return { content: [{ type: "text" as const, text: `Cannot update status — ${msg}` }] };
-      }
-      throw err;
+      return { content: [{ type: "text" as const, text: `Cannot update status: ${(err as Error).message}` }], isError: true };
     }
   }
 
@@ -1012,12 +1251,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   if (name === "pairai_list_tasks") {
     await loadPublicKeys();
-    const data = (await hubGet("/tasks")) as Array<{
+    const qs = args.status ? `?status=${args.status}` : "";
+    const data = (await hubGet(`/tasks${qs}`)) as Array<{
       id: string; status: string; title: string; encrypted?: boolean;
       description?: string; descriptionKeys?: any; senderSignature?: string; initiatorAgentId?: string;
     }>;
-    const filtered = args.status ? data.filter((t) => t.status === args.status) : data;
-    const decrypted = filtered.map((t) => {
+    const decrypted = data.map((t) => {
       if (t.encrypted) {
         const desc = decryptTaskDescription(t, t.id);
         return { ...t, title: desc.split("\n")[0] || t.title, description: desc };
@@ -1047,6 +1286,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     const decryptedMsgs = msgs.map((m) => {
       if (data.encrypted) {
+        // Encrypted file messages: content is a file ID (short nanoid), not ciphertext
+        if (m.contentType === "encrypted" && m.encryptedKeys && m.content && m.content.length < 30 && !/[/+=]/.test(m.content)) {
+          return { ...m, content: `[Encrypted file — use pairai_download_file with task_id: "${data.id}", file_id: "${m.content}"]`, contentType: "file" };
+        }
         try {
           const d = decryptMessage(m, data.id);
           return { ...m, content: d.content, contentType: d.contentType };
@@ -1292,6 +1535,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 
+  if (name === "pairai_report_usage") {
+    const { task_id, cost } = args as { task_id: string; cost: number };
+    try {
+      const result = await hubPost(`/tasks/${task_id}/usage`, { cost });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
   if (name === "pairai_block_agent") {
     const { agent_id } = args as { agent_id: string };
     try {
@@ -1326,6 +1579,12 @@ function decryptMessage(
 ): { content: string; contentType: string } {
   if (msg.contentType !== "encrypted" || !msg.encryptedKeys || !msg.senderSignature || !PRIVATE_KEY) {
     return { content: msg.content, contentType: msg.contentType };
+  }
+  // Encrypted file messages: content is a file ID (nanoid), not ciphertext.
+  // The signature covers the encrypted file data on disk, not the file ID reference.
+  // Don't attempt to decrypt — the file is retrieved and decrypted via download_file.
+  if (msg.content && msg.content.length < 30 && !/[/+=]/.test(msg.content)) {
+    return { content: `[Encrypted file attachment — file_id: ${msg.content}]`, contentType: "file" };
   }
   try {
     const keys = typeof msg.encryptedKeys === "string" ? JSON.parse(msg.encryptedKeys) : msg.encryptedKeys;
@@ -1407,7 +1666,7 @@ async function poll() {
       const decryptedMessages = (taskMsgs ?? []).map((m) => {
         // Encrypted file messages: content is a file ID (short nanoid), not ciphertext
         if (m.contentType === "encrypted" && m.encryptedKeys && m.content.length < 30) {
-          return "[File attachment — use pairai_download_file to retrieve]";
+          return `[File attachment — use pairai_download_file with task_id: "${task.id}", file_id: "${m.content}"]`;
         }
         try {
           const d = decryptMessage(m, task.id);
@@ -1460,7 +1719,7 @@ async function poll() {
         const isEncryptedFile = msg.contentType === "encrypted" && msg.encryptedKeys && msg.content.length < 30;
         let decrypted: { content: string; contentType: string };
         if (isEncryptedFile) {
-          decrypted = { content: "[File attachment — use pairai_download_file to retrieve]", contentType: "text" };
+          decrypted = { content: `[File attachment — use pairai_download_file with task_id: "${unread.taskId}", file_id: "${msg.content}"]`, contentType: "text" };
         } else {
           try {
             decrypted = decryptMessage(msg, unread.taskId);

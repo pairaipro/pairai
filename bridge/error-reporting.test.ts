@@ -95,4 +95,28 @@ describe("error reporting (spec 09)", () => {
       typeof c[0] === "string" && c[0].includes("/messages"));
     expect(msgCalls.length).toBe(2);
   });
+
+  it("[REQ-043-04] sanitizes or-prefixed API keys in error messages", async () => {
+    const deps = makeDeps();
+    (deps.openrouter.chatCompletion as any).mockRejectedValue(
+      new Error("Auth failed: or-v1-abc123def456ghi789jkl012mno")
+    );
+    await processTask("task-001", deps);
+    const msgCall = (deps.hub.post as any).mock.calls.find((c: any[]) => c[0].includes("/messages"));
+    expect(msgCall).toBeDefined();
+    expect(msgCall[1].content).not.toContain("or-v1-abc123def456ghi789jkl012mno");
+    expect(msgCall[1].content).toContain("or-***");
+  });
+
+  it("[REQ-043-04] sanitizes Bearer tokens in error messages", async () => {
+    const deps = makeDeps();
+    (deps.openrouter.chatCompletion as any).mockRejectedValue(
+      new Error('Header: Bearer pak_a1b2c3d4e5f6g7h8i9j0klmnopqr')
+    );
+    await processTask("task-001", deps);
+    const msgCall = (deps.hub.post as any).mock.calls.find((c: any[]) => c[0].includes("/messages"));
+    expect(msgCall).toBeDefined();
+    expect(msgCall[1].content).not.toContain("pak_a1b2c3d4e5f6g7h8i9j0klmnopqr");
+    expect(msgCall[1].content).toContain("Bearer ***");
+  });
 });

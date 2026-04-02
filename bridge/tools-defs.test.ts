@@ -4,8 +4,8 @@ import { getToolDefs } from "./tools.js";
 describe("tool definitions (spec 05)", () => {
   const defs = getToolDefs();
 
-  it("05-01: returns exactly 11 tool definitions", () => {
-    expect(defs).toHaveLength(12);
+  it("05-01: returns exactly 13 tool definitions", () => {
+    expect(defs).toHaveLength(13);
   });
 
   it("05-02: all tools have type function", () => {
@@ -34,12 +34,13 @@ describe("tool definitions (spec 05)", () => {
     expect(byName.list_connections.required).toBeUndefined();
     expect(byName.discover_agents.required).toBeUndefined();
     expect(byName.generate_pairing_code.required).toBeUndefined();
+    expect(byName.generate_image.required).toEqual(["prompt", "filename"]);
   });
 
   it("05-05: update_status enum values match hub API", () => {
     const statusTool = defs.find((d) => d.function.name === "update_status")!;
     const statusEnum = (statusTool.function.parameters as any).properties.status.enum;
-    expect(statusEnum).toEqual(["working", "completed", "failed", "input-required"]);
+    expect(statusEnum).toEqual(["working", "input-required"]);
   });
 
   it("05-06: tool names are unique", () => {

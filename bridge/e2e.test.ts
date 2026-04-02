@@ -17,6 +17,7 @@ import { generateKeyPairSync, createHash } from "node:crypto";
 import { HubClient } from "./hub.js";
 import { OpenRouterClient } from "./openrouter.js";
 import { pollOnce, type PollDeps } from "./poll.js";
+import { fetchModelPricing } from "./pricing.js";
 import { localEncrypt, localDecrypt } from "../channel/lib.js";
 
 /* ------------------------------------------------------------------ */
@@ -46,6 +47,7 @@ interface MockTask {
   targetAgentId: string;
   descriptionKeys?: Record<string, string>;
   senderSignature?: string;
+  reportedUsage?: number;
   messages: Array<{
     id: string;
     senderAgentId: string;
@@ -64,6 +66,8 @@ interface MockHubState {
   pairingCodes: Map<string, string>; // code -> agentId
   updateCursors: Map<string, number>; // agentId -> last acked cursor
   nextId: number;
+  usageCallCount: number;       // tracks POST /usage calls
+  usageFailAfter: number | null; // if set, return 402 after N successful /usage calls
 }
 
 function createMockHub(): { server: Server; state: MockHubState } {
@@ -74,6 +78,8 @@ function createMockHub(): { server: Server; state: MockHubState } {
     pairingCodes: new Map(),
     updateCursors: new Map(),
     nextId: 1,
+    usageCallCount: 0,
+    usageFailAfter: null,
   };
 
   function genId(prefix: string): string {
@@ -194,6 +200,23 @@ function createMockHub(): { server: Server; state: MockHubState } {
       return json(200, { ok: true });
     }
 
+    // POST /tasks/:id/usage
+    const usageMatch = url.match(/^(?:\/api\/v1)?\/tasks\/([^/]+)\/usage$/);
+    if (usageMatch && method === "POST") {
+      const agent = authedAgent(req);
+      if (!agent) return json(401, { error: "Unauthorized" });
+      const task = state.tasks.find((t) => t.id === usageMatch[1]);
+      if (!task) return json(404, { error: "Not found" });
+      state.usageCallCount++;
+      // Simulate credit depletion after N calls
+      if (state.usageFailAfter !== null && state.usageCallCount > state.usageFailAfter) {
+        return json(402, { error: "Insufficient credits" });
+      }
+      if (!task.reportedUsage) task.reportedUsage = 0;
+      task.reportedUsage += body?.cost ?? 0;
+      return json(200, { credits: 0.45 });
+    }
+
     // POST /tasks/:id/messages
     const msgMatch = url.match(/^(?:\/api\/v1)?\/tasks\/([^/]+)\/messages$/);
     if (msgMatch && method === "POST") {
@@ -290,6 +313,13 @@ describe.skipIf(!canRun)("e2e bridge tests (spec 13)", () => {
       usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
     });
     orServer = createServer(async (req, res) => {
+      // Serve /models for pricing tests (REQ-043-11)
+      if (req.url === "/models" || req.url === "/v1/models") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ data: [
+          { id: "test/mock-model", pricing: { prompt: "0.000001", completion: "0.000002" } },
+        ] }));
+      }
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
       const body = JSON.parse(Buffer.concat(chunks).toString());
@@ -297,6 +327,9 @@ describe.skipIf(!canRun)("e2e bridge tests (spec 13)", () => {
       res.end(JSON.stringify(orHandler(body)));
     });
     await new Promise<void>((r) => orServer.listen(0, () => { orPort = (orServer.address() as any).port; r(); }));
+
+    // Load model pricing from mock OpenRouter (for REQ-043-13/14 tests)
+    await fetchModelPricing(`http://localhost:${orPort}/models`);
 
     // Register two agents via POST /agents
     const resA = await fetch(`http://localhost:${hubPort}/agents`, {
@@ -384,7 +417,7 @@ describe.skipIf(!canRun)("e2e bridge tests (spec 13)", () => {
 
     const task = hubState.tasks.find((t) => t.title === "Auto-accept test");
     expect(task).toBeDefined();
-    expect(task!.status).toBe("working");
+    expect(task!.status).toBe("completed");
   });
 
   it("13-03: follow-up message triggers additional reply", async () => {
@@ -581,5 +614,80 @@ describe.skipIf(!canRun)("e2e bridge tests (spec 13)", () => {
     // Second poll should skip (seen set)
     await pollOnce(deps, seen);
     expect(callCount).toBe(firstCallCount); // No additional OR calls
+  });
+
+  it("[REQ-043-13] bridge reports usage to hub after model call", async () => {
+    const hubA = new HubClient(`http://localhost:${hubPort}`, agentA.apiKey);
+    const createRes = (await hubA.post("/tasks", {
+      targetAgentId: agentB.id,
+      title: "Usage report test",
+      description: "Should report cost",
+    })) as { id: string };
+
+    hubState.usageCallCount = 0;
+    hubState.usageFailAfter = null;
+
+    orHandler = () => ({
+      choices: [{ message: { role: "assistant", content: "Done" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    });
+
+    // Use model name that matches mock pricing
+    const deps = makeDeps(agentB);
+    deps.config.model = "test/mock-model";
+    await pollOnce(deps, new Set());
+
+    const task = hubState.tasks.find((t) => t.id === createRes.id);
+    expect(task).toBeDefined();
+    // Usage should have been reported (10*0.000001 + 5*0.000002 = 0.00002)
+    expect(task!.reportedUsage).toBeGreaterThan(0);
+    expect(task!.reportedUsage).toBeCloseTo(0.00002, 6);
+  });
+
+  it("[REQ-043-14] mid-task credit depletion does not abort current reply", async () => {
+    const hubA = new HubClient(`http://localhost:${hubPort}`, agentA.apiKey);
+    const createRes = (await hubA.post("/tasks", {
+      targetAgentId: agentB.id,
+      title: "Depletion test",
+      description: "Credits run out mid-task",
+    })) as { id: string };
+
+    // Make /usage fail after 1 successful call (simulates credit depletion on round 2)
+    hubState.usageCallCount = 0;
+    hubState.usageFailAfter = 1;
+
+    let round = 0;
+    orHandler = () => {
+      round++;
+      if (round === 1) {
+        // First round: tool call (triggers usage report #1 — succeeds)
+        return {
+          choices: [{ message: {
+            role: "assistant", content: null,
+            tool_calls: [{ id: "tc1", type: "function", function: { name: "reply", arguments: JSON.stringify({ message: "Working on it" }) } }],
+          }, finish_reason: "tool_calls" }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        };
+      }
+      // Second round: final reply (triggers usage report #2 — fails with 402)
+      return {
+        choices: [{ message: { role: "assistant", content: "Final answer despite depleted credits" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 },
+      };
+    };
+
+    const deps = makeDeps(agentB);
+    deps.config.model = "test/mock-model";
+    await pollOnce(deps, new Set());
+
+    // Despite the 402 on second usage report, reply should still be delivered
+    const task = hubState.tasks.find((t) => t.id === createRes.id);
+    expect(task).toBeDefined();
+    const finalMsg = task!.messages.find((m) => m.content === "Final answer despite depleted credits");
+    expect(finalMsg).toBeDefined();
+    // Task should still be completed
+    expect(task!.status).toBe("completed");
+    // First usage call succeeded, second failed
+    expect(hubState.usageCallCount).toBe(2);
   });
 });

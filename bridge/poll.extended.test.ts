@@ -53,7 +53,7 @@ describe("poll extended (spec 07)", () => {
     expect(deps.hub.post).not.toHaveBeenCalled();
   });
 
-  it("07-04: pollOnce does NOT ack cursor (v0.3.2 poll-ack race fix)", async () => {
+  it("07-04: pollOnce acks cursor after processing updates", async () => {
     const deps = makeDeps();
     (deps.hub.get as any).mockImplementation((path: string) => {
       if (path === "/connections") return [];
@@ -62,7 +62,7 @@ describe("poll extended (spec 07)", () => {
       return {};
     });
     await pollOnce(deps, new Set());
-    expect(deps.hub.post).not.toHaveBeenCalledWith("/updates/ack", expect.anything());
+    expect(deps.hub.post).toHaveBeenCalledWith("/updates/ack", { cursor: 42 });
   });
 
   it("07-05: pollOnce skips already-seen task IDs", async () => {

@@ -89,4 +89,56 @@ model: "openai/gpt-4o"
     writeFileSync(configPath, `hub_url: "http://localhost:3000"`);
     expect(() => loadConfig(configPath)).toThrow();
   });
+
+  it("[REQ-043-05] throws on non-numeric temperature", () => {
+    const configPath = join(TMP, "bridge.yaml");
+    writeFileSync(configPath, `
+hub_url: "http://localhost:3000"
+api_key: "pak_test"
+key_file: "/tmp/key.pem"
+openrouter_key: "sk-or-test"
+model: "openai/gpt-4o"
+temperature: "hot"
+`);
+    expect(() => loadConfig(configPath)).toThrow("temperature must be a number");
+  });
+
+  it("[REQ-043-05] throws on temperature > 2", () => {
+    const configPath = join(TMP, "bridge.yaml");
+    writeFileSync(configPath, `
+hub_url: "http://localhost:3000"
+api_key: "pak_test"
+key_file: "/tmp/key.pem"
+openrouter_key: "sk-or-test"
+model: "openai/gpt-4o"
+temperature: 5.0
+`);
+    expect(() => loadConfig(configPath)).toThrow("temperature must be a number");
+  });
+
+  it("[REQ-043-05] throws on poll_interval_ms below minimum", () => {
+    const configPath = join(TMP, "bridge.yaml");
+    writeFileSync(configPath, `
+hub_url: "http://localhost:3000"
+api_key: "pak_test"
+key_file: "/tmp/key.pem"
+openrouter_key: "sk-or-test"
+model: "openai/gpt-4o"
+poll_interval_ms: 100
+`);
+    expect(() => loadConfig(configPath)).toThrow("poll_interval_ms must be >= 1000");
+  });
+
+  it("[REQ-043-05] throws on invalid log_level", () => {
+    const configPath = join(TMP, "bridge.yaml");
+    writeFileSync(configPath, `
+hub_url: "http://localhost:3000"
+api_key: "pak_test"
+key_file: "/tmp/key.pem"
+openrouter_key: "sk-or-test"
+model: "openai/gpt-4o"
+log_level: "verbose"
+`);
+    expect(() => loadConfig(configPath)).toThrow("log_level must be one of");
+  });
 });

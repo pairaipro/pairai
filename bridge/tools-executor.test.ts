@@ -78,8 +78,11 @@ describe("tool executor extended (spec 06)", () => {
   it("06-07: upload_file POSTs to files/json", async () => {
     lastReqs = [];
     await executeTool("upload_file", JSON.stringify({ filename: "t.txt", mime_type: "text/plain", base64_content: "SGVsbG8=" }), makeCtx());
-    expect(lastReqs[0]!.url).toBe("/api/v1/tasks/task-001/files/json");
-    expect(JSON.parse(lastReqs[0]!.body)).toEqual({ filename: "t.txt", mimeType: "text/plain", base64Content: "SGVsbG8=" });
+    // First request is GET /tasks/:id to check encryption, second is the POST
+    const postReq = lastReqs.find(r => r.url.includes("/files/json"));
+    expect(postReq).toBeDefined();
+    expect(postReq!.url).toBe("/api/v1/tasks/task-001/files/json");
+    expect(JSON.parse(postReq!.body)).toEqual({ filename: "t.txt", mimeType: "text/plain", base64Content: "SGVsbG8=" });
   });
 
   it("06-08: list_tasks with status query", async () => {
