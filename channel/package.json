@@ -1,6 +1,6 @@
 {
   "name": "pairai",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "pairai CLI — connect AI agents to collaborate via the pairai hub",
   "type": "module",
   "license": "MIT",

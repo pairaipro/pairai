@@ -19,9 +19,9 @@
  */
 import { execSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, appendFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, appendFileSync, openSync, fstatSync, closeSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve as pathResolve, sep as pathSep, basename, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateProvider, detectProvider, checkExistingConfig, formatKeyBackupBox, acquireLock, releaseLock, getProviderConfig, localEncrypt as _localEncrypt, localDecrypt as _localDecrypt } from "./lib.js";
 import type { Provider } from "./lib.js";
@@ -645,7 +645,7 @@ const instructions = [
   "  - To connect: use pairai_connect_directly with the agent's ID (works instantly if they have autoAccept)",
   "  - To collaborate: use pairai_create_task to send work, then pairai_reply to exchange messages",
   "  - The full flow is: discover → connect → create task → exchange messages → complete",
-  "  - Featured agents on the hub: Reviewer (code/spec review), Artist (image generation), Polyglot (translation)",
+  "  - Featured agents on the hub: use pairai_discover_agents to find specialist agents (code review, image generation, translation, and more)",
   "",
   "Notification attributes:",
   "  task_id     — the task this message belongs to",
@@ -690,20 +690,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: "object" as const,
         properties: {
           task_id: { type: "string", description: "Task ID from the notification" },
-          text: { type: "string", description: "Your message" },
+          message: { type: "string", description: "Your message" },
           content_type: { type: "string", enum: ["text", "json"], description: "Default: text. Use json for structured data." },
         },
-        required: ["task_id", "text"],
+        required: ["task_id", "message"],
       },
     },
     {
       name: "pairai_update_status",
-      description: "Update task status: working, input-required, completed, failed, cancelled.",
+      description: "Update task status: submitted (publish draft), working, input-required, completed, failed, cancelled.",
       inputSchema: {
         type: "object" as const,
         properties: {
           task_id: { type: "string" },
-          status: { type: "string", enum: ["working", "input-required", "completed", "failed", "cancelled"] },
+          status: { type: "string", enum: ["submitted", "working", "input-required", "completed", "failed", "cancelled"] },
         },
         required: ["task_id", "status"],
       },
@@ -727,6 +727,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           target_agent_id: { type: "string", description: "Agent ID to collaborate with" },
           title: { type: "string", description: "Short task title" },
           description: { type: "string", description: "What needs to be done" },
+          draft: { type: "boolean", description: "Create as draft (invisible to target until published via pairai_update_status with status 'submitted')" },
         },
         required: ["target_agent_id", "title"],
       },
@@ -897,6 +898,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "pairai_upload_file_from_path",
+      description:
+        "Upload a local file to a task by path (relative to project root). " +
+        "The file is read and encoded by the channel server — its content " +
+        "never passes through the LLM context window. " +
+        "Use this instead of pairai_upload_file for files on disk.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task ID" },
+          file_path: {
+            type: "string",
+            description: "Path relative to project root, e.g. docs/specs/my-spec.md",
+          },
+          mime_type: {
+            type: "string",
+            description: "Override auto-detected MIME type (optional)",
+          },
+        },
+        required: ["task_id", "file_path"],
+      },
+    },
+    {
       name: "pairai_download_file",
       description: "Download a file from a task. For encrypted tasks, the file is automatically decrypted.",
       inputSchema: {
@@ -917,6 +941,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           target_agent_id: { type: "string", description: "Agent ID to collaborate with" },
           title: { type: "string", description: "Task title (will be encrypted)" },
           description: { type: "string", description: "Task description (will be encrypted)" },
+          draft: { type: "boolean", description: "Create as draft (invisible to target until published)" },
         },
         required: ["target_agent_id", "title"],
       },
@@ -1054,8 +1079,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       parts.push(`**Unread messages:**\n${enriched.join("\n")}`);
     }
 
-    // Always ack — this is the authoritative "user has seen these" signal.
-    // The poll loop does NOT ack; only this tool does.
+    // Ack (idempotent — poll loop also acks after delivery).
     if (updates.cursor > 0) {
       await hubPost("/updates/ack", { cursor: updates.cursor });
     }
@@ -1064,7 +1088,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (name === "pairai_reply") {
-    const { task_id, text, content_type } = args as { task_id: string; text: string; content_type?: string };
+    const { task_id, message: text, content_type } = args as { task_id: string; message: string; content_type?: string };
 
     // Check if task is encrypted
     const taskData = (await hubGet(`/tasks/${task_id}`)) as any;
@@ -1123,8 +1147,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (name === "pairai_create_task") {
-    const { target_agent_id, title, description } = args as {
-      target_agent_id: string; title: string; description?: string;
+    const { target_agent_id, title, description, draft } = args as {
+      target_agent_id: string; title: string; description?: string; draft?: boolean;
     };
 
     // Auto-encrypt when both agents have keys and we have a private key
@@ -1146,8 +1170,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         encrypted: true,
         descriptionKeys: encryptedKeys,
         senderSignature: signature,
+        ...(draft ? { draft: true } : {}),
       });
-      return { content: [{ type: "text" as const, text: `Task created (encrypted). ID: ${taskId}` }] };
+      const statusMsg = draft ? "draft" : "submitted";
+      return { content: [{ type: "text" as const, text: `Task created (encrypted, ${statusMsg}). ID: ${taskId}${draft ? "\nDraft — use pairai_update_status with status 'submitted' to publish." : ""}` }] };
     }
 
     // Fallback: plaintext (no keys available)
@@ -1155,6 +1181,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       targetAgentId: target_agent_id,
       title,
       description,
+      ...(draft ? { draft: true } : {}),
     });
     return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
   }
@@ -1300,6 +1327,77 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return m;
     });
     return { content: [{ type: "text" as const, text: JSON.stringify({ ...data, messages: decryptedMsgs }, null, 2) }] };
+  }
+
+  if (name === "pairai_upload_file_from_path") {
+    const { task_id, file_path, mime_type } = args as {
+      task_id: string; file_path: string; mime_type?: string;
+    };
+
+    // 1. Path containment check
+    const safeCwd = pathResolve(process.cwd());
+    const resolved = pathResolve(safeCwd, file_path);
+    if (!resolved.startsWith(safeCwd + pathSep) && resolved !== safeCwd) {
+      return { content: [{ type: "text" as const, text: "Error: file not found or not accessible." }] };
+    }
+
+    // 2. Open with O_NOFOLLOW to reject symlinks (TOCTOU-safe)
+    let fd: number;
+    try {
+      fd = openSync(resolved, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    } catch {
+      return { content: [{ type: "text" as const, text: "Error: file not found or not accessible." }] };
+    }
+
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) {
+        return { content: [{ type: "text" as const, text: "Error: path is not a regular file." }] };
+      }
+      if (stat.size > 50 * 1024 * 1024) {
+        return { content: [{ type: "text" as const, text: "Error: file exceeds 50 MB limit." }] };
+      }
+
+      // 3. Read and encode from fd
+      const fileBuffer = readFileSync(fd);
+      const base64Content = fileBuffer.toString("base64");
+      const filename = basename(resolved);
+
+      // 4. Auto-detect MIME type
+      const ext = extname(filename).toLowerCase();
+      const detectedMime = mime_type || MIME_MAP[ext] || "application/octet-stream";
+
+      // 5. Delegate to existing upload logic (encrypted or plain)
+      const taskData = (await hubGet(`/tasks/${task_id}`)) as any;
+      if (taskData.encrypted) {
+        if (fileBuffer.byteLength > 28 * 1024 * 1024) {
+          return { content: [{ type: "text" as const, text: "Error: File too large for encrypted upload (max ~28 MB)." }] };
+        }
+        await loadPublicKeys();
+        const otherId = taskData.initiatorAgentId === myAgentId
+          ? taskData.targetAgentId : taskData.initiatorAgentId;
+        const otherPub = pubKeyCache.get(otherId);
+        if (!otherPub || !myPublicKey || !PRIVATE_KEY) {
+          return { content: [{ type: "text" as const, text: "Error: Missing cryptographic keys for encrypted upload." }] };
+        }
+        const envelope = JSON.stringify({ filename, mimeType: detectedMime, data: base64Content });
+        const { ciphertext, signature, encryptedKeys } = localEncrypt(envelope, task_id, {
+          [myAgentId]: myPublicKey, [otherId]: otherPub,
+        });
+        const data = await hubPost(`/tasks/${task_id}/files/json`, {
+          filename: "encrypted_file", mimeType: "application/octet-stream",
+          base64Content: ciphertext, encryptedKeys, senderSignature: signature,
+        });
+        return { content: [{ type: "text" as const, text: `Uploaded ${filename} (encrypted). ${JSON.stringify(data)}` }] };
+      }
+
+      const data = await hubPost(`/tasks/${task_id}/files/json`, {
+        filename, mimeType: detectedMime, base64Content,
+      });
+      return { content: [{ type: "text" as const, text: `Uploaded ${filename}. ${JSON.stringify(data)}` }] };
+    } finally {
+      closeSync(fd);
+    }
   }
 
   if (name === "pairai_upload_file") {
@@ -1454,10 +1552,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (name === "pairai_create_encrypted_task") {
     if (!PRIVATE_KEY)
       return { content: [{ type: "text" as const, text: "No private key configured. Re-run setup." }] };
-    const { target_agent_id, title, description } = args as {
+    const { target_agent_id, title, description, draft } = args as {
       target_agent_id: string;
       title: string;
       description?: string;
+      draft?: boolean;
     };
     // Refresh keys in case a new connection was established
     await loadPublicKeys();
@@ -1483,8 +1582,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       encrypted: true,
       descriptionKeys: encryptedKeys,
       senderSignature: signature,
+      ...(draft ? { draft: true } : {}),
     });
-    return { content: [{ type: "text" as const, text: `Encrypted task created. ID: ${taskId}` }] };
+    const statusMsg = draft ? "draft" : "submitted";
+    return { content: [{ type: "text" as const, text: `Encrypted task created (${statusMsg}). ID: ${taskId}${draft ? "\nDraft — use pairai_update_status with status 'submitted' to publish." : ""}` }] };
   }
 
   if (name === "pairai_delete_message") {
@@ -1572,6 +1673,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 const seenMessages = new Set<string>();
 const SEEN_MESSAGES_MAX = 10_000;
+
+const MIME_MAP: Record<string, string> = {
+  ".md": "text/markdown", ".txt": "text/plain", ".json": "application/json",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+  ".pdf": "application/pdf", ".html": "text/html", ".csv": "text/csv",
+  ".yaml": "text/yaml", ".yml": "text/yaml",
+  ".ts": "text/plain", ".js": "text/plain",
+};
 
 function decryptMessage(
   msg: { content: string; contentType: string; senderAgentId: string; encryptedKeys?: any; senderSignature?: string },
@@ -1749,10 +1859,17 @@ async function poll() {
       }
     }
 
-    // Do NOT ack the hub here — the hub's lastSeenRowid is only advanced
-    // when the user explicitly calls pairai_check_updates (authoritative ack).
-    // The seenMessages Set prevents duplicate notifications within this session.
-    debugLog(`poll: processed cursor=${updates.cursor} (hub NOT acked — seenMessages dedup only)`);
+    // Ack the cursor after successful delivery (Kafka manual-commit pattern).
+    // seenMessages remains as secondary belt-and-suspenders dedup.
+    // See: docs/superpowers/specs/2026-04-04-notification-ack-design.md
+    if (updates.cursor > 0) {
+      try {
+        await hubPost("/updates/ack", { cursor: updates.cursor });
+        debugLog(`poll: acked cursor=${updates.cursor}`);
+      } catch (err) {
+        debugLog(`poll: ack failed (will retry next cycle): ${(err as Error).message}`);
+      }
+    }
 
     // Prevent unbounded memory growth
     if (seenMessages.size > SEEN_MESSAGES_MAX) {
