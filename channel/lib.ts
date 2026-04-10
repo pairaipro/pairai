@@ -43,14 +43,14 @@ export function detectProvider(): Provider | null {
 }
 
 export interface ProviderConfig {
-  /** Config file path (project-level or global) */
+  /** Config file path (project-level or user-scoped) */
   configPath: string;
   /** MCP server key name in the config */
   mcpKey: string;
   /** Format: "json" or "toml" */
   format: "json" | "toml";
-  /** Whether this provider only supports global config */
-  globalOnly: boolean;
+  /** Whether this provider only supports user-scoped config */
+  userOnly: boolean;
   /** Post-setup instruction */
   instruction: string;
 }
@@ -62,34 +62,42 @@ export function getProviderConfig(
   provider: Provider,
   cwd: string,
   homeDir: string,
-  useGlobal: boolean,
+  useUser: boolean,
 ): ProviderConfig {
   switch (provider) {
     case "claude":
-      return {
-        configPath: join(cwd, ".mcp.json"),
-        mcpKey: "pairai-channel",
-        format: "json",
-        globalOnly: false,
-        instruction: "Start Claude Code in this directory",
-      };
+      return useUser
+        ? {
+            configPath: join(homeDir, ".claude", "settings.json"),
+            mcpKey: "pairai-channel",
+            format: "json",
+            userOnly: false,
+            instruction: "Restart Claude Code to activate the pairai MCP server",
+          }
+        : {
+            configPath: join(cwd, ".mcp.json"),
+            mcpKey: "pairai-channel",
+            format: "json",
+            userOnly: false,
+            instruction: "Start Claude Code in this directory",
+          };
     case "gemini": {
-      const dir = useGlobal ? join(homeDir, ".gemini") : join(cwd, ".gemini");
+      const dir = useUser ? join(homeDir, ".gemini") : join(cwd, ".gemini");
       return {
         configPath: join(dir, "settings.json"),
         mcpKey: "pairai",
         format: "json",
-        globalOnly: false,
+        userOnly: false,
         instruction: "Restart Gemini CLI to activate the pairai MCP server",
       };
     }
     case "cursor": {
-      const dir = useGlobal ? join(homeDir, ".cursor") : join(cwd, ".cursor");
+      const dir = useUser ? join(homeDir, ".cursor") : join(cwd, ".cursor");
       return {
         configPath: join(dir, "mcp.json"),
         mcpKey: "pairai",
         format: "json",
-        globalOnly: false,
+        userOnly: false,
         instruction: "Restart Cursor to activate the pairai MCP server",
       };
     }
@@ -98,7 +106,7 @@ export function getProviderConfig(
         configPath: join(cwd, ".vscode", "mcp.json"),
         mcpKey: "pairai",
         format: "json",
-        globalOnly: false,
+        userOnly: false,
         instruction: "Reload VS Code window (Ctrl+Shift+P → Developer: Reload Window)",
       };
     case "windsurf":
@@ -106,28 +114,28 @@ export function getProviderConfig(
         configPath: join(homeDir, ".codeium", "windsurf", "mcp_config.json"),
         mcpKey: "pairai",
         format: "json",
-        globalOnly: true,
+        userOnly: true,
         instruction: "Restart Windsurf to activate the pairai MCP server",
       };
     case "codex": {
-      const dir = useGlobal ? join(homeDir, ".codex") : join(cwd, ".codex");
+      const dir = useUser ? join(homeDir, ".codex") : join(cwd, ".codex");
       return {
         configPath: join(dir, "config.toml"),
         mcpKey: "pairai",
         format: "toml",
-        globalOnly: false,
+        userOnly: false,
         instruction: "Restart Codex CLI to activate the pairai MCP server",
       };
     }
     case "amazonq": {
-      const path = useGlobal
+      const path = useUser
         ? join(homeDir, ".aws", "amazonq", "default.json")
         : join(cwd, ".amazonq", "default.json");
       return {
         configPath: path,
         mcpKey: "pairai",
         format: "json",
-        globalOnly: false,
+        userOnly: false,
         instruction: "Restart Amazon Q to activate the pairai MCP server",
       };
     }
@@ -149,9 +157,9 @@ export function checkExistingConfig(
   provider: Provider,
   cwd: string,
   homeDir: string,
-  useGlobal: boolean,
+  useUser: boolean,
 ): string | null {
-  const cfg = getProviderConfig(provider, cwd, homeDir, useGlobal);
+  const cfg = getProviderConfig(provider, cwd, homeDir, useUser);
   if (!existsSync(cfg.configPath)) return null;
 
   if (cfg.format === "toml") {

@@ -3,7 +3,7 @@
  * pairai CLI — connect AI agents via the pairai hub
  *
  * Commands:
- *   npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]
+ *   npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--user | --project] [--force]
  *   npx pairai serve [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq]
  *   npx pairai uninstall [--provider ...] [--delete-agent]  — remove MCP config, save credentials to ~/.pairai/agents/
  *   npx pairai upgrade     — update to latest version (preserves keys and config)
@@ -68,20 +68,39 @@ if (command === "version" || args.includes("--version") || args.includes("-v")) 
 // ── Help ────────────────────────────────────────────────────────────────────
 
 if (command === "help" || args.includes("--help") || args.includes("-h")) {
-  console.log(`pairai v${VERSION}\n`);
+  console.log(`pairai v${VERSION} — connect AI agents to collaborate via the pairai hub\n`);
   console.log("Commands:");
-  console.log('  setup "Agent Name" [--hub URL] [--provider ...] [--global] [--force]');
-  console.log("  serve [--provider ...]          — start the MCP channel server");
+  console.log('  setup "Agent Name" [options]    — register agent and configure MCP server');
+  console.log("  serve [--provider ...]          — start the MCP channel server (stdio)");
   console.log("  uninstall [--provider ...] [--delete-agent]");
+  console.log("                                  — remove MCP config, preserve credentials");
   console.log("  upgrade                         — update to latest version");
   console.log("  version                         — show version");
-  console.log("\nProviders: claude, gemini, cursor, copilot, windsurf, codex, amazonq");
-  console.log("\nEnvironment variables:");
+  console.log("\nSetup options:");
+  console.log("  --hub URL           Hub URL (default: https://pairai.pro)");
+  console.log("  --provider NAME     AI tool to configure (see list below)");
+  console.log("  --project           Write MCP config to current project directory (default)");
+  console.log("  --user              Write MCP config to user home directory (~/)");
+  console.log("                      Makes pairai available in all projects without per-project setup");
+  console.log("  --force             Overwrite existing config without prompting");
+  console.log("\nProviders:");
+  console.log("  claude              Claude Code / Claude Desktop  (.mcp.json or ~/.claude/settings.json)");
+  console.log("  gemini              Gemini CLI                    (.gemini/ or ~/.gemini/settings.json)");
+  console.log("  cursor              Cursor IDE                    (.cursor/ or ~/.cursor/mcp.json)");
+  console.log("  copilot             GitHub Copilot (VS Code)      (.vscode/mcp.json)");
+  console.log("  windsurf            Windsurf IDE                  (~/.codeium/windsurf/ — user only)");
+  console.log("  codex               Codex CLI                     (.codex/ or ~/.codex/config.toml)");
+  console.log("  amazonq             Amazon Q Developer            (.amazonq/ or ~/.aws/amazonq/)");
+  console.log("\nEnvironment variables (for serve command):");
   console.log("  PAIRAI_HUB_URL      Hub URL (default: https://pairai.pro)");
   console.log("  PAIRAI_AGENT_CRED   Agent API key");
   console.log("  PAIRAI_KEY_FILE     Path to RSA private key .pem");
   console.log("  PAIRAI_POLL_MS      Poll interval in ms (default: 5000)");
   console.log("  PAIRAI_DEBUG=1      Verbose log to ~/.pairai/debug.log");
+  console.log("\nExamples:");
+  console.log('  npx pairai setup "My Assistant"');
+  console.log('  npx pairai setup "My Assistant" --provider claude --user');
+  console.log("  npx pairai uninstall --provider cursor --delete-agent");
   process.exit(0);
 }
 
@@ -153,18 +172,18 @@ if (command === "uninstall") {
   let removed = 0;
   let savedCredentials = false;
 
-  // Collect both project-level and user/global-level config paths
+  // Collect both project-level and user-scoped config paths
   const scopes: Array<{ label: string; cfg: ReturnType<typeof getProviderConfig> }> = [];
   scopes.push({ label: "project", cfg: getProviderConfig(provider, cwd, home, false) });
-  if (!getProviderConfig(provider, cwd, home, false).globalOnly) {
+  if (!getProviderConfig(provider, cwd, home, false).userOnly) {
     scopes.push({ label: "user", cfg: getProviderConfig(provider, cwd, home, true) });
   }
-  // For claude, also check ~/.mcp.json (user-scope global config)
+  // For claude, also check legacy ~/.mcp.json (user-scope config from older versions)
   if (provider === "claude") {
     const userMcpJson = join(home, ".mcp.json");
     scopes.push({
       label: "user (~/.mcp.json)",
-      cfg: { configPath: userMcpJson, mcpKey: "pairai-channel", format: "json" as const, globalOnly: true, instruction: "" },
+      cfg: { configPath: userMcpJson, mcpKey: "pairai-channel", format: "json" as const, userOnly: true, instruction: "" },
     });
   }
 
@@ -354,8 +373,12 @@ if (command === "setup") {
       process.exit(1);
     }
   }
-  const globalIdx = rest.indexOf("--global");
-  const useGlobal = globalIdx !== -1 ? (rest.splice(globalIdx, 1), true) : false;
+  // --user installs to user home directory; --project (default) installs to current project
+  // --global is accepted as a backward-compatible alias for --user
+  const userIdx = Math.max(rest.indexOf("--user"), rest.indexOf("--global"));
+  const useUser = userIdx !== -1 ? (rest.splice(userIdx, 1), true) : false;
+  const projectIdx = rest.indexOf("--project");
+  if (projectIdx !== -1) rest.splice(projectIdx, 1); // explicit default, just consume it
   let agentName = rest.find((a) => !a.startsWith("--"));
 
   const forceIdx = rest.indexOf("--force");
@@ -367,14 +390,14 @@ if (command === "setup") {
         validate: (v) => v.trim().length > 0 && v.trim().length <= 64 ? true : "Name must be 1-64 characters",
       });
     } else {
-      console.error('Usage: npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]');
+      console.error('Usage: npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--user | --project] [--force]');
       process.exit(1);
     }
   }
 
   // Check for existing config to avoid accidental overwrites
   if (!useForce) {
-    const existingConfigPath = checkExistingConfig(provider, process.cwd(), homedir(), useGlobal);
+    const existingConfigPath = checkExistingConfig(provider, process.cwd(), homedir(), useUser);
     if (existingConfigPath) {
       console.error(`\n  pairai is already configured in ${existingConfigPath}`);
       console.error(`  Running setup again would overwrite the existing API key and config.`);
@@ -417,7 +440,7 @@ if (command === "setup") {
   for (const line of formatKeyBackupBox(keyPath)) console.log(line);
   console.log();
 
-  const cfg = getProviderConfig(provider, process.cwd(), homedir(), useGlobal);
+  const cfg = getProviderConfig(provider, process.cwd(), homedir(), useUser);
   const serverEntry = {
     command: "npx",
     args: ["pairai", "serve"],
@@ -463,8 +486,12 @@ if (command === "setup") {
   console.log(`    3. Share the code with another agent to connect`);
   if (provider === "claude") {
     console.log();
-    console.log(`  Optional: Enable real-time notifications (research preview):`);
-    console.log(`    claude --dangerously-load-development-channels`);
+    console.log(`  Tips for Claude Code:`);
+    console.log(`    Auto-allow all pairai tools — add to .claude/settings.local.json:`);
+    console.log(`      { "permissions": { "allow": ["mcp__${cfg.mcpKey}__*"] } }`);
+    console.log();
+    console.log(`    Enable real-time notifications (research preview):`);
+    console.log(`      claude --dangerously-load-development-channels server:${cfg.mcpKey}`);
   }
 
   console.log();
@@ -476,7 +503,7 @@ if (command === "setup") {
 if (command !== "serve") {
   console.error(`pairai v${VERSION}\n`);
   console.error("Usage:");
-  console.error('  npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--global] [--force]');
+  console.error('  npx pairai setup "Agent Name" [--hub URL] [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq] [--user | --project] [--force]');
   console.error("  npx pairai serve [--provider claude|gemini|cursor|copilot|windsurf|codex|amazonq]");
   console.error("  npx pairai uninstall [--provider ...] [--delete-agent]  — remove MCP config, preserve keys");
   console.error("  npx pairai upgrade        — update to latest version");
@@ -1039,49 +1066,71 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   if (name === "pairai_check_updates") {
     await loadPublicKeys();
-    const updates = (await hubGet("/updates")) as {
-      hasUpdates: boolean;
-      pendingTasks: Array<{ id: string; title: string; fromAgent: string }>;
-      unreadMessages: Array<{ taskId: string; taskTitle: string; count: number }>;
+    const updates = (await hubGet("/events")) as {
+      events: Array<{
+        id: number;
+        type: string;
+        taskId: string | null;
+        fromAgentId: string | null;
+        data: Record<string, unknown>;
+        createdAt: string;
+      }>;
       cursor: number;
+      hasMore: boolean;
     };
 
-    if (!updates.hasUpdates) {
+    if (updates.events.length === 0) {
       return { content: [{ type: "text" as const, text: "No updates. You're all caught up." }] };
     }
 
     const parts: string[] = [];
 
-    if (updates.pendingTasks.length > 0) {
+    const taskEvents = updates.events.filter(e => e.type === "task.created" || e.type === "task.approval_required");
+    if (taskEvents.length > 0) {
       const enriched: string[] = [];
-      for (const task of updates.pendingTasks) {
-        const full = (await hubGet(`/tasks/${task.id}`)) as any;
-        const desc = full.encrypted ? decryptTaskDescription(full, task.id) : (full.description ?? "");
-        const title = desc.split("\n")[0] || task.title;
-        enriched.push(`- "${title}" from ${task.fromAgent} (task ID: ${task.id})`);
+      for (const event of taskEvents) {
+        if (!event.taskId) continue;
+        const full = (await hubGet(`/tasks/${event.taskId}`)) as any;
+        const desc = full.encrypted ? decryptTaskDescription(full, event.taskId) : (full.description ?? "");
+        const title = desc.split("\n")[0] || full.title || "Untitled";
+        const fromAgent = (event.data.fromAgentName as string) ?? event.fromAgentId ?? "unknown";
+        enriched.push(`- "${title}" from ${fromAgent} (task ID: ${event.taskId})${event.type === "task.approval_required" ? " [APPROVAL REQUIRED]" : ""}`);
       }
-      parts.push(`**${updates.pendingTasks.length} pending task(s):**\n${enriched.join("\n")}`);
+      parts.push(`**${taskEvents.length} pending task(s):**\n${enriched.join("\n")}`);
     }
 
-    if (updates.unreadMessages.length > 0) {
+    const msgEvents = updates.events.filter(e => e.type === "message.created");
+    if (msgEvents.length > 0) {
+      // Group by taskId for summary
+      const byTask = new Map<string, typeof msgEvents>();
+      for (const event of msgEvents) {
+        if (!event.taskId) continue;
+        const list = byTask.get(event.taskId) ?? [];
+        list.push(event);
+        byTask.set(event.taskId, list);
+      }
       const enriched: string[] = [];
-      for (const unread of updates.unreadMessages) {
-        const full = (await hubGet(`/tasks/${unread.taskId}`)) as any;
-        const msgs = (full.messages ?? []) as Array<any>;
-        const recent = msgs.slice(-unread.count);
+      for (const [taskId, events] of byTask) {
+        const full = (await hubGet(`/tasks/${taskId}`)) as any;
+        const taskTitle = full.title ?? "Untitled";
+        const msgs = (await hubGet(`/tasks/${taskId}/messages`)) as Array<any>;
         const previews: string[] = [];
-        for (const m of recent) {
-          const d = full.encrypted ? decryptMessage(m, unread.taskId) : { content: m.content, contentType: m.contentType };
-          previews.push(d.content.slice(0, 100));
+        for (const event of events) {
+          const messageId = event.data.messageId as string | undefined;
+          const msg = messageId ? msgs.find((m: any) => m.id === messageId) : msgs[msgs.length - 1];
+          if (msg) {
+            const d = full.encrypted ? decryptMessage(msg, taskId) : { content: msg.content, contentType: msg.contentType };
+            previews.push(d.content.slice(0, 100));
+          }
         }
-        enriched.push(`- ${unread.count} new in "${unread.taskTitle}" (task ID: ${unread.taskId})\n  Preview: ${previews.join(" | ")}`);
+        enriched.push(`- ${events.length} new in "${taskTitle}" (task ID: ${taskId})\n  Preview: ${previews.join(" | ")}`);
       }
       parts.push(`**Unread messages:**\n${enriched.join("\n")}`);
     }
 
     // Ack (idempotent — poll loop also acks after delivery).
     if (updates.cursor > 0) {
-      await hubPost("/updates/ack", { cursor: updates.cursor });
+      await hubPost("/events/ack", { cursor: updates.cursor });
     }
 
     return { content: [{ type: "text" as const, text: parts.join("\n\n") }] };
@@ -1671,9 +1720,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // ── Polling ──────────────────────────────────────────────────────────────────
 
-const seenMessages = new Set<string>();
-const SEEN_MESSAGES_MAX = 10_000;
-
 const MIME_MAP: Record<string, string> = {
   ".md": "text/markdown", ".txt": "text/plain", ".json": "application/json",
   ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -1735,147 +1781,163 @@ function decryptTaskDescription(
   return full.description ?? "";
 }
 
+async function deliverEventNotification(event: {
+  id: number;
+  type: string;
+  taskId: string | null;
+  fromAgentId: string | null;
+  data: Record<string, unknown>;
+  createdAt: string;
+}) {
+  const fromAgent = (event.data.fromAgentName as string) ?? event.fromAgentId ?? "unknown";
+
+  if (event.type === "task.created" || event.type === "task.approval_required") {
+    if (!event.taskId) return;
+
+    const full = (await hubGet(`/tasks/${event.taskId}`)) as {
+      title?: string;
+      description?: string;
+      encrypted?: boolean;
+      descriptionKeys?: any;
+      senderSignature?: string;
+      initiatorAgentId?: string;
+      approvalStatus?: string | null;
+    };
+    const taskMsgs = (await hubGet(`/tasks/${event.taskId}/messages`)) as Array<{
+      content: string;
+      contentType: string;
+      senderAgentId: string;
+      encryptedKeys?: any;
+      senderSignature?: string;
+    }>;
+
+    const desc = decryptTaskDescription(full, event.taskId);
+    const taskTitle = desc.split("\n")[0] || full.title || "Untitled";
+    const decryptedMessages = (taskMsgs ?? []).map((m) => {
+      // Encrypted file messages: content is a file ID (short nanoid), not ciphertext
+      if (m.contentType === "encrypted" && m.encryptedKeys && m.content.length < 30) {
+        return `[File attachment — use pairai_download_file with task_id: "${event.taskId}", file_id: "${m.content}"]`;
+      }
+      try {
+        const d = decryptMessage(m, event.taskId!);
+        return d.content;
+      } catch {
+        return "[decryption failed]";
+      }
+    });
+
+    const isPendingApproval = full.approvalStatus === "pending" || event.type === "task.approval_required";
+    const approvalPrefix = isPendingApproval ? "[APPROVAL REQUIRED] " : "";
+    const approvalSuffix = isPendingApproval
+      ? `\n\nThis task requires your approval before the agent will act on it.\nUse pairai_approve_task or pairai_reject_task with task ID: ${event.taskId}`
+      : "";
+
+    const body = approvalPrefix + [desc || taskTitle, ...decryptedMessages.map((c) => `> ${c}`)].join("\n\n") + approvalSuffix;
+
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: body,
+        meta: { task_id: event.taskId, task_title: taskTitle, from_agent: fromAgent, event_type: "new_task" },
+      },
+    });
+    console.error(`[pairai] channel notification sent: new_task ${event.taskId} from ${fromAgent}${isPendingApproval ? " [APPROVAL REQUIRED]" : ""}`);
+
+  } else if (event.type === "message.created") {
+    if (!event.taskId) return;
+
+    const msgs = (await hubGet(`/tasks/${event.taskId}/messages`)) as Array<{
+      id: string;
+      content: string;
+      contentType: string;
+      senderAgentId: string;
+      encryptedKeys?: any;
+      senderSignature?: string;
+    }>;
+    if (!msgs || msgs.length === 0) return;
+
+    const messageId = event.data.messageId as string | undefined;
+    const msg = messageId ? msgs.find((m) => m.id === messageId) : msgs[msgs.length - 1];
+    if (!msg) return;
+
+    // Encrypted file messages: content is a file ID (short nanoid), not ciphertext
+    const isEncryptedFile = msg.contentType === "encrypted" && msg.encryptedKeys && msg.content.length < 30;
+    let decrypted: { content: string; contentType: string };
+    if (isEncryptedFile) {
+      decrypted = { content: `[File attachment — use pairai_download_file with task_id: "${event.taskId}", file_id: "${msg.content}"]`, contentType: "text" };
+    } else {
+      try {
+        decrypted = decryptMessage(msg, event.taskId);
+      } catch {
+        decrypted = { content: "[decryption failed]", contentType: "text" };
+      }
+    }
+
+    const full = (await hubGet(`/tasks/${event.taskId}`)) as { title?: string };
+    const taskTitle = full.title ?? "Untitled";
+
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: decrypted.content,
+        meta: {
+          task_id: event.taskId,
+          task_title: taskTitle,
+          from_agent: fromAgent,
+          event_type: "new_message",
+          content_type: decrypted.contentType,
+        },
+      },
+    });
+    console.error(`[pairai] channel notification sent: new_message in ${event.taskId}`);
+
+  } else {
+    debugLog(`poll: skipping event type=${event.type} id=${event.id}`);
+  }
+}
+
 async function poll() {
   try {
     // Refresh public keys to pick up new connections
     await loadPublicKeys();
 
-    const updates = (await hubGet("/updates")) as {
-      hasUpdates: boolean;
-      pendingTasks: Array<{ id: string; title: string; fromAgent: string }>;
-      unreadMessages: Array<{ taskId: string; taskTitle: string; count: number }>;
+    const updates = (await hubGet("/events")) as {
+      events: Array<{
+        id: number;
+        type: string;
+        taskId: string | null;
+        fromAgentId: string | null;
+        data: Record<string, unknown>;
+        createdAt: string;
+      }>;
       cursor: number;
+      hasMore: boolean;
     };
 
-    debugLog(`poll: hasUpdates=${updates.hasUpdates} tasks=${updates.pendingTasks.length} messages=${updates.unreadMessages.length} cursor=${updates.cursor}`);
-    if (!updates.hasUpdates) return;
-    console.error(`[pairai] poll: ${updates.pendingTasks.length} tasks, ${updates.unreadMessages.length} messages`);
+    debugLog(`poll: ${updates.events.length} events, cursor=${updates.cursor}, hasMore=${updates.hasMore}`);
 
-    for (const task of updates.pendingTasks) {
-      const key = `task:${task.id}`;
-      if (seenMessages.has(key)) { debugLog(`skip seen task ${task.id}`); continue; }
-      seenMessages.add(key);
+    if (updates.events.length === 0) return;
 
-      const full = (await hubGet(`/tasks/${task.id}`)) as {
-        description?: string;
-        encrypted?: boolean;
-        descriptionKeys?: any;
-        senderSignature?: string;
-        initiatorAgentId?: string;
-        approvalStatus?: string | null;
-      };
-      const taskMsgs = (await hubGet(`/tasks/${task.id}/messages`)) as Array<{
-        content: string;
-        contentType: string;
-        senderAgentId: string;
-        encryptedKeys?: any;
-        senderSignature?: string;
-      }>;
-
-      const desc = decryptTaskDescription(full, task.id);
-      const decryptedMessages = (taskMsgs ?? []).map((m) => {
-        // Encrypted file messages: content is a file ID (short nanoid), not ciphertext
-        if (m.contentType === "encrypted" && m.encryptedKeys && m.content.length < 30) {
-          return `[File attachment — use pairai_download_file with task_id: "${task.id}", file_id: "${m.content}"]`;
-        }
-        try {
-          const d = decryptMessage(m, task.id);
-          return d.content;
-        } catch {
-          return "[decryption failed]";
-        }
-      });
-
-      const isPendingApproval = full.approvalStatus === "pending";
-      const approvalPrefix = isPendingApproval ? "[APPROVAL REQUIRED] " : "";
-      const approvalSuffix = isPendingApproval
-        ? `\n\nThis task requires your approval before the agent will act on it.\nUse pairai_approve_task or pairai_reject_task with task ID: ${task.id}`
-        : "";
-
-      const body = approvalPrefix + [desc || task.title, ...decryptedMessages.map((c) => `> ${c}`)].join("\n\n") + approvalSuffix;
-
+    for (const event of updates.events) {
       try {
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: body,
-            meta: { task_id: task.id, task_title: task.title, from_agent: task.fromAgent, event_type: "new_task" },
-          },
-        });
-        console.error(`[pairai] channel notification sent: new_task ${task.id} from ${task.fromAgent}${isPendingApproval ? " [APPROVAL REQUIRED]" : ""}`);
+        await deliverEventNotification(event);
       } catch (err) {
-        console.error(`[pairai] channel notification FAILED: ${(err as Error).message}`);
+        console.error(`[pairai] notification delivery failed for event ${event.id}: ${(err as Error).message}`);
       }
     }
 
-    for (const unread of updates.unreadMessages) {
-      const msgs = (await hubGet(`/tasks/${unread.taskId}/messages`)) as Array<{
-        id: string;
-        content: string;
-        contentType: string;
-        senderAgentId: string;
-        encryptedKeys?: any;
-        senderSignature?: string;
-      }>;
-
-      debugLog(`unread: taskId=${unread.taskId} count=${unread.count} fetched=${msgs?.length ?? 0}`);
-      if (!msgs || msgs.length === 0) continue;
-      for (const msg of msgs.slice(-unread.count)) {
-        const key = `msg:${msg.id}`;
-        if (seenMessages.has(key)) { debugLog(`skip seen msg ${msg.id}`); continue; }
-        seenMessages.add(key);
-
-        // Encrypted file messages: content is a file ID (short nanoid), not ciphertext
-        const isEncryptedFile = msg.contentType === "encrypted" && msg.encryptedKeys && msg.content.length < 30;
-        let decrypted: { content: string; contentType: string };
-        if (isEncryptedFile) {
-          decrypted = { content: `[File attachment — use pairai_download_file with task_id: "${unread.taskId}", file_id: "${msg.content}"]`, contentType: "text" };
-        } else {
-          try {
-            decrypted = decryptMessage(msg, unread.taskId);
-          } catch {
-            decrypted = { content: "[decryption failed]", contentType: "text" };
-          }
-        }
-
-        try {
-          await mcp.notification({
-            method: "notifications/claude/channel",
-            params: {
-              content: decrypted.content,
-              meta: {
-                task_id: unread.taskId,
-                task_title: unread.taskTitle,
-                from_agent: msg.senderAgentId,
-                event_type: "new_message",
-                content_type: decrypted.contentType,
-              },
-            },
-          });
-          console.error(`[pairai] channel notification sent: new_message in ${unread.taskId}`);
-        } catch (err) {
-          console.error(`[pairai] channel notification FAILED: ${(err as Error).message}`);
-        }
-      }
-    }
-
-    // Ack the cursor after successful delivery (Kafka manual-commit pattern).
-    // seenMessages remains as secondary belt-and-suspenders dedup.
-    // See: docs/superpowers/specs/2026-04-04-notification-ack-design.md
+    // Ack after successful delivery
     if (updates.cursor > 0) {
       try {
-        await hubPost("/updates/ack", { cursor: updates.cursor });
+        await hubPost("/events/ack", { cursor: updates.cursor });
         debugLog(`poll: acked cursor=${updates.cursor}`);
       } catch (err) {
         debugLog(`poll: ack failed (will retry next cycle): ${(err as Error).message}`);
       }
     }
 
-    // Prevent unbounded memory growth
-    if (seenMessages.size > SEEN_MESSAGES_MAX) {
-      const excess = seenMessages.size - SEEN_MESSAGES_MAX;
-      const iter = seenMessages.values();
-      for (let i = 0; i < excess; i++) seenMessages.delete(iter.next().value!);
+    if (updates.hasMore) {
+      setImmediate(poll);
     }
   } catch (err) {
     console.error(`[pairai] poll error: ${(err as Error).message}`);

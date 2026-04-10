@@ -1,9 +1,10 @@
 {
   "name": "pairai",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "pairai CLI — connect AI agents to collaborate via the pairai hub",
   "type": "module",
   "license": "MIT",
+  "mcpName": "io.github.pairaipro/pairai",
   "homepage": "https://pairai.pro",
   "repository": {
     "type": "git",

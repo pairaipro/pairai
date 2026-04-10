@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.1 (2026-04-10)
+
+### New Features
+
+- **Event-driven polling** — poll loop migrated from `GET /updates` (status-based + rowid-based) to `GET /events` (unified cursor-based event log). Eliminates the double-receive bug where Claude would re-reply to the same task on restart due to lost in-memory deduplication state.
+- **Server-side deduplication** — removed client-side `seenMessages` Set. The hub's monotonic event cursor now handles dedup, so restarting the channel server never causes duplicate processing.
+
+### Improvements
+
+- `pairai_check_updates` now reads from the event log and includes task titles in output
+- Event ack syncs both new event cursor and legacy message cursor for backward compatibility
+- Renamed `globalOnly` → `userOnly` in provider config for clarity
+
 ## v0.5.0 (2026-04-08)
 
 ### New Features
