@@ -14,6 +14,7 @@
  *      PAIRAI_KEY_FILE     — path to RSA private key .pem
  *      PAIRAI_POLL_MS      — poll interval in ms (default: 5000)
  *      PAIRAI_LOCK_DIR     — lock file directory (default: ~/.pairai/locks)
+ *      PAIRAI_CHANNEL_NOTIFICATIONS — "1" = poll loop acks server cursor (for Claude with --channel)
  *      PAIRAI_DEBUG        — verbose log: "1" for ~/.pairai/debug.log, or a file path
  * Legacy: PAIRAI_URL, PAIRAI_API_KEY, PAIRAI_PRIVATE_KEY_PATH
  */
@@ -96,6 +97,7 @@ if (command === "help" || args.includes("--help") || args.includes("-h")) {
   console.log("  PAIRAI_AGENT_CRED   Agent API key");
   console.log("  PAIRAI_KEY_FILE     Path to RSA private key .pem");
   console.log("  PAIRAI_POLL_MS      Poll interval in ms (default: 5000)");
+  console.log("  PAIRAI_CHANNEL_NOTIFICATIONS=1  Poll acks cursor (Claude --channel)");
   console.log("  PAIRAI_DEBUG=1      Verbose log to ~/.pairai/debug.log");
   console.log("\nExamples:");
   console.log('  npx pairai setup "My Assistant"');
@@ -515,6 +517,7 @@ if (command !== "serve") {
   console.error("  PAIRAI_KEY_FILE     Path to RSA private key .pem file");
   console.error("  PAIRAI_POLL_MS      Poll interval in ms (default: 5000)");
   console.error("  PAIRAI_LOCK_DIR     Lock file directory (default: ~/.pairai/locks)");
+  console.error("  PAIRAI_CHANNEL_NOTIFICATIONS=1  Poll acks cursor (Claude --channel)");
   console.error("  PAIRAI_DEBUG=1      Verbose log to ~/.pairai/debug.log");
   console.error("  PAIRAI_DEBUG=<path> Verbose log to custom file");
   process.exit(1);
@@ -1128,9 +1131,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       parts.push(`**Unread messages:**\n${enriched.join("\n")}`);
     }
 
-    // Ack (idempotent — poll loop also acks after delivery).
+    // Ack server-side cursor. For channel-capable clients the poll loop also acks,
+    // but for non-channel clients this is the only place the server cursor advances.
     if (updates.cursor > 0) {
       await hubPost("/events/ack", { cursor: updates.cursor });
+      // Sync local poll cursor so we don't re-notify for these events
+      if (!channelCapable && updates.cursor > lastNotifiedEventId) {
+        lastNotifiedEventId = updates.cursor;
+      }
     }
 
     return { content: [{ type: "text" as const, text: parts.join("\n\n") }] };
@@ -1896,12 +1904,81 @@ async function deliverEventNotification(event: {
   }
 }
 
+// Detect whether the MCP client reliably surfaces channel notifications.
+// Walk the process tree to find Claude Code with --dangerously-load-development-channels server:pairai-channel.
+// Falls back to PAIRAI_CHANNEL_NOTIFICATIONS=1 env var (non-Linux or custom setups).
+const CHANNEL_FLAG = "--dangerously-load-development-channels";
+const CHANNEL_VALUE = "server:pairai-channel";
+
+function detectChannelCapable(): boolean {
+  if (process.env.PAIRAI_CHANNEL_NOTIFICATIONS === "1") {
+    debugLog("detect-channel: PAIRAI_CHANNEL_NOTIFICATIONS=1 (env override)");
+    return true;
+  }
+  if (process.platform !== "linux") {
+    debugLog(`detect-channel: platform=${process.platform} (not linux, skipping /proc walk)`);
+    return false;
+  }
+  try {
+    let pid = String(process.ppid);
+    debugLog(`detect-channel: starting walk from ppid=${pid}`);
+    for (let i = 0; i < 10; i++) {
+      const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf-8").split("\0").filter(Boolean);
+      const bin = cmdline[0] ?? "";
+      debugLog(`detect-channel: pid=${pid} bin=${bin} args=${JSON.stringify(cmdline.slice(1))}`);
+      if (bin === "claude" || bin.endsWith("/claude")) {
+        // Check for our specific channel: --flag server:pairai-channel or --flag=server:pairai-channel
+        let found = false;
+        const channelArgs: string[] = [];
+        for (let j = 1; j < cmdline.length; j++) {
+          const arg = cmdline[j]!;
+          if (arg === CHANNEL_FLAG && cmdline[j + 1]) {
+            channelArgs.push(cmdline[j + 1]!);
+            if (cmdline[j + 1] === CHANNEL_VALUE) found = true;
+            j++; // skip value
+          } else if (arg.startsWith(`${CHANNEL_FLAG}=`)) {
+            const val = arg.slice(CHANNEL_FLAG.length + 1);
+            channelArgs.push(val);
+            if (val === CHANNEL_VALUE) found = true;
+          }
+        }
+        debugLog(`detect-channel: found claude binary at pid=${pid}, channels=${JSON.stringify(channelArgs)}, looking for="${CHANNEL_VALUE}", match=${found}`);
+        return found;
+      }
+      // Walk up: read ppid from /proc/<pid>/stat
+      // Format: "pid (comm) state ppid ..." — comm can contain spaces/parens,
+      // so find the LAST ")" to skip past it, then parse fields after it.
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+      const afterComm = stat.slice(stat.lastIndexOf(")") + 2);
+      const nextPid = afterComm.split(" ")[1]; // fields: state ppid ...
+      debugLog(`detect-channel: pid=${pid} → ppid=${nextPid}`);
+      if (!nextPid || nextPid === "1" || nextPid === "0") {
+        debugLog(`detect-channel: reached process tree root (pid=${nextPid}), stopping`);
+        break;
+      }
+      pid = nextPid;
+    }
+    debugLog("detect-channel: exhausted process tree without finding claude binary");
+  } catch (err) {
+    debugLog(`detect-channel: error walking /proc: ${(err as Error).message}`);
+  }
+  return false;
+}
+const channelCapable = detectChannelCapable();
+
+// For non-channel clients: track the highest event ID we've notified for locally,
+// so we don't re-deliver on each poll cycle. Not used when channelCapable=true.
+let lastNotifiedEventId = 0;
+
 async function poll() {
   try {
     // Refresh public keys to pick up new connections
     await loadPublicKeys();
 
-    const updates = (await hubGet("/events")) as {
+    // Non-channel clients: use local cursor to avoid re-notifying, but don't touch server cursor.
+    // Channel clients: use server cursor (default behavior — omit after=).
+    const afterQs = !channelCapable && lastNotifiedEventId > 0 ? `?after=${lastNotifiedEventId}` : "";
+    const updates = (await hubGet(`/events${afterQs}`)) as {
       events: Array<{
         id: number;
         type: string;
@@ -1914,7 +1991,7 @@ async function poll() {
       hasMore: boolean;
     };
 
-    debugLog(`poll: ${updates.events.length} events, cursor=${updates.cursor}, hasMore=${updates.hasMore}`);
+    debugLog(`poll: ${updates.events.length} events, cursor=${updates.cursor}, hasMore=${updates.hasMore}${channelCapable ? "" : `, localCursor=${lastNotifiedEventId}`}`);
 
     if (updates.events.length === 0) return;
 
@@ -1926,14 +2003,20 @@ async function poll() {
       }
     }
 
-    // Ack after successful delivery
-    if (updates.cursor > 0) {
-      try {
-        await hubPost("/events/ack", { cursor: updates.cursor });
-        debugLog(`poll: acked cursor=${updates.cursor}`);
-      } catch (err) {
-        debugLog(`poll: ack failed (will retry next cycle): ${(err as Error).message}`);
+    if (channelCapable) {
+      // Channel clients: ack server-side — notifications are reliably delivered
+      if (updates.cursor > 0) {
+        try {
+          await hubPost("/events/ack", { cursor: updates.cursor });
+          debugLog(`poll: acked cursor=${updates.cursor}`);
+        } catch (err) {
+          debugLog(`poll: ack failed (will retry next cycle): ${(err as Error).message}`);
+        }
       }
+    } else {
+      // Non-channel clients: advance local cursor only, leave server cursor for check_updates
+      lastNotifiedEventId = updates.cursor;
+      debugLog(`poll: local cursor advanced to ${lastNotifiedEventId}`);
     }
 
     if (updates.hasMore) {
@@ -1948,7 +2031,9 @@ async function poll() {
 // ── Start ────────────────────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport());
-console.error(`[pairai] connected. provider=${serveProvider} channel=${!!capabilities.experimental?.["claude/channel"]} agent=${myAgentId || "(loading)"}`);
+console.error(`[pairai] connected. provider=${serveProvider} channelNotifications=${channelCapable} agent=${myAgentId || "(loading)"}`);
+debugLog(`startup: provider=${serveProvider} channelCapable=${channelCapable} (${channelCapable ? "poll acks server cursor" : "poll uses local cursor, check_updates acks"})`);
+
 await loadAgentInfo();
 if (!myAgentId) {
   console.error("[pairai] failed to load agent info from hub. Cannot start polling.");
