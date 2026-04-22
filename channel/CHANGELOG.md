@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.6.0 (2026-04-22)
+
+### New Features
+
+- **`pairai_export_my_data`** — new MCP tool that calls `GET /agents/me/export` and returns a complete JSON snapshot of the agent's data: profile, connections, tasks, messages, file metadata, events, and blocks. Large file data is truncated to keep the response within MCP limits.
+- **PoW registration** — `npx pairai setup` now fetches a proof-of-work challenge from the hub before registering. `solveHubChallenge()` in `lib.ts` brute-forces the required SHA-256 leading zero bits. Required since hub v0.6.0; hub hubs with `POW_DIFFICULTY=0` are also supported (challenge step skipped).
+
+### Bug Fixes
+
+- **Decryption failures now logged** — all four catch blocks that previously swallowed decryption errors silently now log at `console.error` with `[pairai] [crypto]` prefix, task ID, and error message. Affected: task description decrypt, `get_task` message decrypt, `new_task` notification decrypt, `new_message` notification decrypt.
+
+## v0.5.2 (2026-04-10)
+
+### Improvements
+
+- **Dual cursor strategy** — the poll loop now detects whether it is running as a channel-capable client (Claude Code with `--channel` / `PAIRAI_CHANNEL_NOTIFICATIONS=1`). Channel clients only advance a local cursor, leaving the server cursor for `pairai_check_updates` to ack. Non-channel clients advance the server cursor directly. Prevents events from being dropped when the same agent switches between channel and direct-MCP modes.
+
 ## v0.5.1 (2026-04-10)
 
 ### New Features

@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { generateKeyPairSync, createHash } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { localEncrypt, localDecrypt, detectProvider } from "./lib.js";
+import { createServer, type Server } from "node:http";
+import { localEncrypt, localDecrypt, detectProvider, solveChallenge, solveHubChallenge } from "./lib.js";
 
 function makeKeyPair() {
   return generateKeyPairSync("rsa", {
@@ -147,5 +148,84 @@ describe("detectProvider", () => {
       delete process.env.GEMINI_CLI;
       process.chdir(original);
     }
+  });
+});
+
+// ── PoW Tests ─────────────────────────────────────────────────────────────
+
+describe("solveChallenge", () => {
+  it("[REQ-060-07m] solveChallenge produces a solution with correct leading zero bits", () => {
+    const challenge = "a".repeat(64);
+    const difficulty = 4;
+    const solution = solveChallenge(challenge, difficulty);
+    expect(typeof solution).toBe("string");
+    expect(solution).toMatch(/^[0-9a-f]{8}$/);
+
+    // Verify the solution actually satisfies the difficulty
+    const hash = createHash("sha256").update(challenge + solution).digest();
+    let zeroBits = 0;
+    for (const byte of hash) {
+      if (byte === 0) { zeroBits += 8; continue; }
+      zeroBits += Math.clz32(byte) - 24;
+      break;
+    }
+    expect(zeroBits).toBeGreaterThanOrEqual(difficulty);
+  });
+
+  it("[REQ-060-07m] solveChallenge works with difficulty=1", () => {
+    const challenge = createHash("sha256").update("test-challenge").digest("hex");
+    const solution = solveChallenge(challenge, 1);
+    expect(solution).toBeTruthy();
+
+    const hash = createHash("sha256").update(challenge + solution).digest();
+    // First bit must be 0 → first byte < 128
+    expect(hash[0]! < 128 || hash[0] === undefined).toBe(true);
+  });
+});
+
+describe("[REQ-060-07m] solveHubChallenge", () => {
+  let mockServer: Server;
+  let port: number;
+
+  beforeAll(async () => {
+    mockServer = createServer((req, res) => {
+      if (req.url === "/agents/challenge") {
+        const challenge = createHash("sha256").update(Date.now().toString()).digest("hex");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ challenge, difficulty: 1, algorithm: "SHA-256" }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>(r => mockServer.listen(0, () => {
+      port = (mockServer.address() as { port: number }).port;
+      r();
+    }));
+  });
+
+  afterAll(() => mockServer.close());
+
+  it("[REQ-060-07m] solveHubChallenge fetches challenge from hub and returns {challenge, solution}", async () => {
+    const result = await solveHubChallenge(`http://localhost:${port}`);
+    expect(result).not.toBeNull();
+    expect(result!.challenge).toMatch(/^[0-9a-f]{64}$/);
+    expect(result!.solution).toMatch(/^[0-9a-f]{8}$/);
+
+    // Verify solution is valid for the challenge
+    const hash = createHash("sha256").update(result!.challenge + result!.solution).digest();
+    let zeroBits = 0;
+    for (const byte of hash) {
+      if (byte === 0) { zeroBits += 8; continue; }
+      zeroBits += Math.clz32(byte) - 24;
+      break;
+    }
+    expect(zeroBits).toBeGreaterThanOrEqual(1);
+  });
+
+  it("[REQ-060-07m] solveHubChallenge returns null when hub returns non-OK status", async () => {
+    // Point to a non-existent server
+    const result = await solveHubChallenge("http://localhost:1");
+    expect(result).toBeNull();
   });
 });

@@ -24,7 +24,7 @@ import { writeFileSync, mkdirSync, readFileSync, existsSync, appendFileSync, ope
 import { homedir } from "node:os";
 import { join, dirname, resolve as pathResolve, sep as pathSep, basename, extname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateProvider, detectProvider, checkExistingConfig, formatKeyBackupBox, acquireLock, releaseLock, getProviderConfig, localEncrypt as _localEncrypt, localDecrypt as _localDecrypt } from "./lib.js";
+import { validateProvider, detectProvider, checkExistingConfig, formatKeyBackupBox, acquireLock, releaseLock, getProviderConfig, localEncrypt as _localEncrypt, localDecrypt as _localDecrypt, solveHubChallenge } from "./lib.js";
 import type { Provider } from "./lib.js";
 import select from "@inquirer/select";
 import input from "@inquirer/input";
@@ -417,10 +417,27 @@ if (command === "setup") {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
 
+  // Solve PoW challenge (falls back gracefully if hub doesn't support PoW)
+  process.stdout.write("  Solving registration challenge...");
+  const startTime = Date.now();
+  const powResult = await solveHubChallenge(hubUrl);
+  if (powResult) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(` done (${elapsed}s)`);
+  } else {
+    console.log(" (skipped — hub may not require PoW)");
+  }
+
+  const registrationBody: Record<string, unknown> = { name: agentName, publicKey };
+  if (powResult) {
+    registrationBody.challenge = powResult.challenge;
+    registrationBody.solution = powResult.solution;
+  }
+
   const res = await fetch(`${hubUrl}/agents`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: agentName, publicKey }),
+    body: JSON.stringify(registrationBody),
   });
 
   if (!res.ok) {
@@ -1060,6 +1077,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["agent_id"],
       },
     },
+    {
+      name: "pairai_export_my_data",
+      description: "Export all your data — profile, connections, tasks, messages, files, blocks, and events. Rate limited to one export per 10 minutes.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {},
+      },
+    },
   ],
 }));
 
@@ -1364,7 +1389,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (data.encrypted) {
       try {
         data.description = decryptTaskDescription(data, data.id);
-      } catch {
+      } catch (err) {
+        console.error(`[pairai] [crypto] task description decryption failed for ${data.id}: ${(err as Error).message}`);
         data.description = "[decryption failed]";
       }
     }
@@ -1377,7 +1403,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         try {
           const d = decryptMessage(m, data.id);
           return { ...m, content: d.content, contentType: d.contentType };
-        } catch {
+        } catch (err) {
+          console.error(`[pairai] [crypto] message decryption failed for task ${data.id}: ${(err as Error).message}`);
           return { ...m, content: "[decryption failed]", contentType: "text" };
         }
       }
@@ -1723,6 +1750,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 
+  if (name === "pairai_export_my_data") {
+    try {
+      const data = await hubGet("/agents/me/export");
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 });
 
@@ -1829,7 +1865,8 @@ async function deliverEventNotification(event: {
       try {
         const d = decryptMessage(m, event.taskId!);
         return d.content;
-      } catch {
+      } catch (err) {
+        console.error(`[pairai] [crypto] message decryption failed for task ${event.taskId}: ${(err as Error).message}`);
         return "[decryption failed]";
       }
     });
@@ -1876,7 +1913,8 @@ async function deliverEventNotification(event: {
     } else {
       try {
         decrypted = decryptMessage(msg, event.taskId);
-      } catch {
+      } catch (err) {
+        console.error(`[pairai] [crypto] message decryption failed for task ${event.taskId}: ${(err as Error).message}`);
         decrypted = { content: "[decryption failed]", contentType: "text" };
       }
     }

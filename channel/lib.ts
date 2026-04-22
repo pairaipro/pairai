@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import {
   publicEncrypt, privateDecrypt, sign, verify,
   randomBytes, createCipheriv, createDecipheriv,
+  createHash,
   constants as cryptoConstants,
 } from "node:crypto";
 
@@ -302,6 +303,42 @@ export function localEncrypt(
 /**
  * Verify signature, unwrap AES key with own private key, decrypt AES-256-GCM.
  */
+/**
+ * Solve a PoW challenge by finding a nonce such that
+ * SHA-256(challenge + nonce) has at least `difficulty` leading zero bits.
+ */
+export function solveChallenge(challenge: string, difficulty: number): string {
+  let nonce = 0;
+  while (true) {
+    const solution = nonce.toString(16).padStart(8, "0");
+    const hash = createHash("sha256").update(challenge + solution).digest();
+    let zeroBits = 0;
+    for (const byte of hash) {
+      if (byte === 0) { zeroBits += 8; continue; }
+      zeroBits += Math.clz32(byte) - 24;
+      break;
+    }
+    if (zeroBits >= difficulty) return solution;
+    nonce++;
+  }
+}
+
+/**
+ * Fetch a PoW challenge from the hub and solve it.
+ * Returns { challenge, solution } or null if the hub doesn't support PoW.
+ */
+export async function solveHubChallenge(hubUrl: string): Promise<{ challenge: string; solution: string } | null> {
+  try {
+    const res = await fetch(`${hubUrl}/agents/challenge`);
+    if (!res.ok) return null;
+    const data = await res.json() as { challenge: string; difficulty: number };
+    const solution = solveChallenge(data.challenge, data.difficulty);
+    return { challenge: data.challenge, solution };
+  } catch {
+    return null;
+  }
+}
+
 export function localDecrypt(
   ciphertext: string,
   sig: string,
