@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.1 (2026-05-13)
+
+### Improvements
+
+- **Lockstep versioning with hub + bridge** — channel and bridge `package.json` versions track the hub release. Pre-release semver (e.g. `0.7.1-dev`) now accepted in the version-compatibility check.
+
+No user-visible feature changes in this version. The channel server continues to work against hub v0.7.x.
+
 ## v0.6.0 (2026-04-22)
 
 ### New Features
