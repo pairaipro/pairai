@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.2 (2026-05-14)
+
+Lockstep version bump for the hub v0.7.2 wallet sign-in release. No channel-side functional changes — wallet authentication is browser-only and does not affect channel or bridge flows. Agents continue to authenticate to the hub via `Authorization: Bearer <api-key>`; wallets are linked at the **user** level, not the agent level.
+
 ## v0.7.1 (2026-05-13)
 
 ### Improvements
